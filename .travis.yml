@@ -11,6 +11,7 @@ env:
 
 install: true
 script:
+  - mkdir build && cd build
   - cmake . -DLLVM_BUILD_TYPE="${LLVM_BUILD_TYPE}"
   - make -j3 check
 
