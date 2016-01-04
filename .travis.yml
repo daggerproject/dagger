@@ -11,8 +11,8 @@ install:
   - if [ $TRAVIS_OS_NAME != osx ]; then sudo apt-get install cmake-data cmake g++-4.7; fi
 
 env:
-  - LLVM_BUILD_TYPE=Release
-  - LLVM_BUILD_TYPE=Debug
+  - CMAKE_BUILD_TYPE=Release
+  - CMAKE_BUILD_TYPE=Debug
 
 compiler:
   - clang
@@ -20,7 +20,7 @@ compiler:
 
 script:
   - mkdir build && cd build
-  - cmake .. -DLLVM_BUILD_TYPE="${LLVM_BUILD_TYPE}"
+  - cmake .. -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   - make -j3 check
 
 notifications:
