@@ -3,6 +3,8 @@ os:
   - osx
   - linux
 
+before_install: if [ $TRAVIS_OS_NAME == osx ]; then brew update && brew upgrade cmake; else sudo add-apt-repository --yes ppa:kalakris/cmake && sudo apt-get update -qq && sudo apt-get install cmake; fi
+
 env:
   - LLVM_BUILD_TYPE=Release
   - LLVM_BUILD_TYPE=Debug
