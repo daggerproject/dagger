@@ -17,7 +17,7 @@ install:
   - if [ $TRAVIS_OS_NAME != osx ]; then sudo add-apt-repository --yes ppa:george-edison55/precise-backports; fi
   - if [ $TRAVIS_OS_NAME != osx ]; then sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test; fi
   - if [ $TRAVIS_OS_NAME != osx ]; then sudo apt-get update -qq; fi
-  - if [ $TRAVIS_OS_NAME != osx ]; then sudo apt-get install cmake-data cmake g++-4.7; fi
+  - if [ $TRAVIS_OS_NAME != osx ]; then sudo apt-get install cmake-data cmake g++-4.8; fi
 
 env:
   - CMAKE_BUILD_TYPE=Release
