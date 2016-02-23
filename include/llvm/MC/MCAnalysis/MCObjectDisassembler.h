@@ -1,4 +1,4 @@
-//===-- llvm/MC/MCObjectDisassembler.h --------------------------*- C++ -*-===//
+//===-- llvm/MC/MCAnalysis/MCObjectDisassembler.h ---------------*- C++ -*-===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -12,8 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_MC_MCOBJECTDISASSEMBLER_H
-#define LLVM_MC_MCOBJECTDISASSEMBLER_H
+#ifndef LLVM_MC_MCANALYSIS_MCOBJECTDISASSEMBLER_H
+#define LLVM_MC_MCANALYSIS_MCOBJECTDISASSEMBLER_H
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
@@ -41,9 +41,13 @@ class MCObjectSymbolizer;
 /// consisting of MCFunctions and MCBasicBlocks.
 class MCObjectDisassembler {
 public:
+  /// Usage of a symbolizer is optional. Note that it isn't used to do
+  /// instruction-level symbolization (that is, plugged into MCDisassembler),
+  /// but to symbolize function call targets.
   MCObjectDisassembler(const object::ObjectFile &Obj,
                        const MCDisassembler &Dis,
-                       const MCInstrAnalysis &MIA);
+                       const MCInstrAnalysis &MIA,
+                       MCObjectSymbolizer *MOS = nullptr);
   virtual ~MCObjectDisassembler() {}
 
   /// \brief Build an MCModule, representing an MC-level Control Flow Graph.
@@ -54,22 +58,14 @@ public:
 
   typedef std::vector<uint64_t> AddressSetTy;
   /// \name Create a new MCFunction.
-  MCFunction *createFunction(MCModule *Module, uint64_t BeginAddr,
-                             AddressSetTy &CallTargets,
-                             AddressSetTy &TailCallTargets);
+  // FIXME: This doesn't always "create", what about getOrCreate?
+  MCFunction *createFunction(MCModule *Module, uint64_t BeginAddr);
 
   /// \brief Set the region on which to fallback if disassembly was requested
   /// somewhere not accessible in the object file.
   /// This is used for dynamic disassembly.
   void setFallbackRegion(uint64_t BeginAddr, ArrayRef<uint8_t> Region) {
     FallbackRegion = { BeginAddr, Region };
-  }
-
-  /// \brief Set the symbolizer to use to get information on external functions.
-  /// Note that this isn't used to do instruction-level symbolization (that is,
-  /// plugged into MCDisassembler), but to symbolize function call targets.
-  void setSymbolizer(MCObjectSymbolizer *ObjectSymbolizer) {
-    MOS = ObjectSymbolizer;
   }
 
 protected:
@@ -104,11 +100,10 @@ private:
   /// NOTE: Each MCBasicBlock in a MCFunction is backed by a single MCTextAtom.
   /// When the CFG is built, contiguous instructions that were previously in a
   /// single MCTextAtom will be split in multiple basic block atoms.
-  void buildCFG(MCModule *Module);
+  void buildCFG(MCModule &Module);
 
   void disassembleFunctionAt(MCModule *Module, MCFunction *MCFN,
-                             uint64_t BeginAddr, AddressSetTy &CallTargets,
-                             AddressSetTy &TailCallTargets);
+                             uint64_t BeginAddr);
 };
 
 }

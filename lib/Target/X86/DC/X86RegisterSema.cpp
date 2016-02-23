@@ -135,10 +135,6 @@ static StringRef getCCName(X86::CondCode CC) {
   }
 }
 
-Value *X86RegisterSema::testCondCode(unsigned CondCode) {
-  return getCC((X86::CondCode)CondCode);
-}
-
 Value *X86RegisterSema::getCC(X86::CondCode CC) {
   Value *CCV = CCVals[CC];
   if (CCV)
@@ -381,7 +377,7 @@ void X86RegisterSema::insertFiniRegSetCode(Function *FiniFn) {
 }
 
 void X86RegisterSema::insertExternalWrapperAsm(BasicBlock *WrapperBB,
-                                               Function *ExtFn) {
+                                               Value *ExtFn) {
   DCIRBuilder WBuilder(WrapperBB);
 
   SmallVector<Type *, 20> IAArgTypes;

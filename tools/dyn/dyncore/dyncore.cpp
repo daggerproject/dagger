@@ -15,6 +15,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/MC/MCAnalysis/MCFunction.h"
 #include "llvm/MC/MCAnalysis/MCModule.h"
+#include "llvm/MC/MCAnalysis/MCObjectDisassembler.h"
 #include "llvm/MC/MCAnalysis/MCObjectSymbolizer.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
@@ -24,11 +25,11 @@
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrAnalysis.h"
 #include "llvm/MC/MCInstrInfo.h"
-#include "llvm/MC/MCObjectDisassembler.h"
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Object/MachO.h"
+#include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
@@ -58,17 +59,15 @@ static std::string TripleName;
 
 static StringRef ToolName;
 
-static const Target *getTarget(const ObjectFile *Obj) {
+static const Target *getTarget(const ObjectFile &Obj) {
   // Figure out the target triple.
   Triple TheTriple("unknown-unknown-unknown");
   if (TripleName.empty()) {
-  if (Obj) {
-    TheTriple.setArch(Triple::ArchType(Obj->getArch()));
+    TheTriple.setArch(Triple::ArchType(Obj.getArch()));
     // TheTriple defaults to ELF, and COFF doesn't have an environment:
     // the best we can do here is indicate that it is mach-o.
-    if (Obj->isMachO())
+    if (Obj.isMachO())
       TheTriple.setObjectFormat(Triple::MachO);
-  }
   } else {
     TheTriple.setTriple(TripleName);
   }
@@ -84,6 +83,47 @@ static const Target *getTarget(const ObjectFile *Obj) {
   // Update the triple name and return the found target.
   TripleName = TheTriple.getTriple();
   return TheTarget;
+}
+
+static OwningBinary<MachOObjectFile> openObjectFileAtPath(StringRef Path) {
+  ErrorOr<OwningBinary<Binary>> BinaryOrErr = createBinary(Path);
+  if (std::error_code EC = BinaryOrErr.getError()) {
+    errs() << ToolName << ": '" << Path << "': " << EC.message() << ".\n";
+    exit(1);
+  }
+
+  std::unique_ptr<Binary> Bin;
+  std::unique_ptr<MemoryBuffer> Buf;
+  std::tie(Bin, Buf) = BinaryOrErr.get().takeBinary();
+
+  auto *BinPtr = Bin.release();
+  std::unique_ptr<MachOObjectFile> MOOF;
+
+  if (auto *FatBinPtr = dyn_cast<MachOUniversalBinary>(BinPtr)) {
+    for (auto &Obj : FatBinPtr->objects()) {
+      // FIXME: Realistically, we only support x86_64 for now.
+      // This won't be hardest place to fix.
+      if (Obj.getArchTypeName() != "x86_64")
+        continue;
+      auto SliceOrErr = Obj.getAsObjectFile();
+      if (std::error_code EC = SliceOrErr.getError()) {
+        errs() << ToolName << ": '" << Path << "': " << EC.message() << ".\n";
+        exit(1);
+      }
+      MOOF = std::move(SliceOrErr.get());
+      break;
+    }
+  } else if (auto *MOOFPtr = dyn_cast<MachOObjectFile>(BinPtr)) {
+    MOOF.reset(MOOFPtr);
+  }
+
+  if (!MOOF) {
+    errs() << ToolName << ": '" << Path << "': "
+           << "Unrecognized file type.\n";
+    exit(1);
+  }
+
+  return OwningBinary<MachOObjectFile>(std::move(MOOF), std::move(Buf));
 }
 
 template <typename T>
@@ -174,8 +214,9 @@ static DYNJIT *__dc_JIT;
 //static DenseMap<void *, void *> TranslationCache(128);
 
 static void *__llvm_dc_translate_at(void *addr) {
-  void *ptr;
+  void *ptr = nullptr;
   Function *F = __dc_DT->translateRecursivelyAt((uint64_t)addr);
+  DEBUG(dbgs() << "__llvm_dc_translate_at " << addr << "\n");
   DEBUG(dbgs() << "Jumping to " << F->getName() << "\n");
   ptr = (void*)__dc_JIT->findUnmangledSymbol(F->getName()).getAddress();
   if (!ptr) {
@@ -228,22 +269,11 @@ void dyn_entry(int ac, char **av, const char **envp, const char **apple,
 
   std::string InputFilename = argv[0];
 
-  ErrorOr<OwningBinary<Binary>> BinaryOrErr = createBinary(InputFilename);
-  if (std::error_code EC = BinaryOrErr.getError()) {
-    errs() << ToolName << ": '" << InputFilename << "': " << EC.message() << ".\n";
-    exit(1);
-  }
-  Binary &Binary = *BinaryOrErr.get().getBinary();
+  OwningBinary<MachOObjectFile> MOOFAndBuffer =
+      openObjectFileAtPath(InputFilename);
+  MachOObjectFile &MOOF = *MOOFAndBuffer.getBinary();
 
-
-  ObjectFile *Obj;
-  if (!(Obj = dyn_cast<ObjectFile>(&Binary))) {
-    errs() << ToolName << ": '" << InputFilename << "': "
-           << "Unrecognized file type.\n";
-    exit(1);
-  }
-
-  const Target *TheTarget = getTarget(Obj);
+  const Target *TheTarget = getTarget(MOOF);
 
   // FIXME: why are there unique_ptrs everywhere?
 
@@ -307,19 +337,13 @@ void dyn_entry(int ac, char **av, const char **envp, const char **apple,
   // The first image is the main executable.
   uint64_t VMAddrSlide = _dyld_get_image_vmaddr_slide(0);
 
-  MachOObjectFile *MOOF = dyn_cast<MachOObjectFile>(Obj);
-  if (!MOOF) {
-    errs() << "error: unrecognized object file " << InputFilename << "\n";
-    exit(1);
-  }
-
   // Explicitly use a Mach-O-specific symbolizer to give it dyld info.
   std::unique_ptr<MCMachObjectSymbolizer> MOS(new MCMachObjectSymbolizer(
-      Ctx, std::move(RelInfo), *MOOF, VMAddrSlide));
+      Ctx, std::move(RelInfo), MOOF, VMAddrSlide));
 
   std::unique_ptr<MCObjectDisassembler> OD(
-      new MCObjectDisassembler(*Obj, *DisAsm, *MIA));
-  OD->setSymbolizer(MOS.get());
+      new MCObjectDisassembler(MOOF, *DisAsm, *MIA, MOS.get()));
+
   // FIXME: We need either:
   //  - a custom non-contiguous memory object, for every mapped region.
   //  - a "raw" memory object, that just forwards to memory accesses.
@@ -372,7 +396,7 @@ void dyn_entry(int ac, char **av, const char **envp, const char **apple,
   std::unique_ptr<DCTranslator> DT(
     new DCTranslator(getGlobalContext(), DL,
                      TransOpt::Default, *DIS, *DRS,
-                     *MIP, *STI, *MCM, OD.get()));
+                     *MIP, *STI, *MCM, OD.get(), MOS.get()));
 
   __dc_DT = DT.get();
   __dc_JIT = &J;
@@ -404,10 +428,17 @@ void dyn_entry(int ac, char **av, const char **envp, const char **apple,
 
   RunInitRegSet();
 
-  auto RunIRFunction = [&](Function *Fn) {
+  auto GetIRFunction = [&](Function *Fn) {
     auto FnSymbol = J.findUnmangledSymbol(Fn->getName());
+    uint64_t Addr = FnSymbol.getAddress();
+    DEBUG(dbgs() << "Jitted " << (void *)Addr << " for " << Fn->getName()
+                 << "\n");
+    return Addr;
+  };
+
+  auto RunIRFunction = [&](Function *Fn) {
     DEBUG(dbgs() << "Jumping to " << Fn->getName() << "\n");
-    auto FnPointer = (void (*)(uint8_t *))(intptr_t)FnSymbol.getAddress();
+    auto FnPointer = (void (*)(uint8_t *))(intptr_t)GetIRFunction(Fn);
     return FnPointer(RegSet.data());
   };
 

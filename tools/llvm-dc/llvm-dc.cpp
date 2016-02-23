@@ -189,9 +189,10 @@ int main(int argc, char **argv) {
 
   std::unique_ptr<DCTranslator> DT(new DCTranslator(
       getGlobalContext(), DL, TOLvl, *DIS, *DRS, *MIP, *STI,
-      *MCM, /* MCOD= */ 0, AnnotateIROutput));
+      *MCM, /*MCOD=*/ nullptr, /*MOS=*/nullptr, AnnotateIROutput));
 
-  DT->translateAllKnownFunctions();
+  for (auto &F : MCM->funcs())
+    DT->translateRecursivelyAt(F->getStartAddr());
 
   std::unique_ptr<DCTranslatedInstTracker> DTIT;
   Module *M = DT->finalizeTranslationModule(&DTIT);

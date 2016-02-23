@@ -158,16 +158,32 @@ Function *DCInstrSema::getOrCreateFiniRegSetFunction() {
   return FiniFn;
 }
 
-void DCInstrSema::createExternalWrapperFunction(uint64_t Addr, StringRef Name) {
+Function *DCInstrSema::createExternalWrapperFunction(uint64_t Addr,
+                                                     StringRef Name) {
   Function *ExtFn = cast<Function>(TheModule->getOrInsertFunction(
       Name, FunctionType::get(Builder->getVoidTy(), /*isVarArg=*/false)));
+  return createExternalWrapperFunction(Addr, ExtFn);
+}
+
+Function *DCInstrSema::createExternalWrapperFunction(uint64_t Addr) {
+  Value *ExtFn = ConstantExpr::getIntToPtr(
+      Builder->getInt64(Addr),
+      FunctionType::get(Builder->getVoidTy(), /*isVarArg=*/false)
+          ->getPointerTo());
+
+  return createExternalWrapperFunction(Addr, ExtFn);
+}
+
+Function *DCInstrSema::createExternalWrapperFunction(uint64_t Addr,
+                                                     Value *ExtFn) {
   Function *Fn = getFunction(Addr);
   if (!Fn->isDeclaration())
-    return;
+    return Fn;
 
   BasicBlock *BB = BasicBlock::Create(Ctx, "", Fn);
   DRS.insertExternalWrapperAsm(BB, ExtFn);
   ReturnInst::Create(Ctx, BB);
+  return Fn;
 }
 
 void DCInstrSema::createExternalTailCallBB(uint64_t Addr) {
@@ -175,6 +191,7 @@ void DCInstrSema::createExternalTailCallBB(uint64_t Addr) {
   SwitchToBasicBlock(Addr);
   // Now do the call to that function.
   insertCallBB(getFunction(Addr));
+  // FIXME: should this still insert a regset diffing call?
   // Finally, return directly, bypassing the ExitBB.
   Builder->CreateRetVoid();
 }
@@ -193,7 +210,7 @@ extern "C" uintptr_t __llvm_dc_current_instr = 0;
 
 void DCInstrSema::SwitchToFunction(const MCFunction *MCFN) {
   assert(!MCFN->empty() && "Trying to translate empty MC function");
-  const uint64_t StartAddr = MCFN->getEntryBlock()->getStartAddr();
+  const uint64_t StartAddr = MCFN->getStartAddr();
 
   TheFunction = getFunction(StartAddr);
   TheFunction->setDoesNotAlias(1);

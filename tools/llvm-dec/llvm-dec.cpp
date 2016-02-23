@@ -8,6 +8,7 @@
 #include "llvm/MC/MCAnalysis/MCCachingDisassembler.h"
 #include "llvm/MC/MCAnalysis/MCFunction.h"
 #include "llvm/MC/MCAnalysis/MCModule.h"
+#include "llvm/MC/MCAnalysis/MCObjectDisassembler.h"
 #include "llvm/MC/MCAnalysis/MCObjectSymbolizer.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
@@ -16,7 +17,6 @@
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrAnalysis.h"
 #include "llvm/MC/MCInstrInfo.h"
-#include "llvm/MC/MCObjectDisassembler.h"
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
@@ -190,7 +190,7 @@ int main(int argc, char **argv) {
       TheTarget->createMCInstrAnalysis(MII.get()));
 
   std::unique_ptr<MCObjectDisassembler> OD(
-      new MCObjectDisassembler(*Obj, *DisAsm, *MIA));
+      new MCObjectDisassembler(*Obj, *DisAsm, *MIA, MOS.get()));
   std::unique_ptr<MCModule> MCM(OD->buildModule());
 
   if (!MCM)
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
   std::unique_ptr<DCTranslator> DT(
     new DCTranslator(getGlobalContext(), DL,
                      TOLvl, *DIS, *DRS, *MIP, *STI, *MCM,
-                     OD.get(), AnnotateIROutput));
+                     OD.get(), MOS.get(), AnnotateIROutput));
 
   if (!TranslationEntrypoint)
     TranslationEntrypoint = MOS->getEntrypoint();
@@ -234,7 +234,8 @@ int main(int argc, char **argv) {
   DT->createMainFunctionWrapper(
       DT->translateRecursivelyAt(TranslationEntrypoint));
 
-  DT->translateAllKnownFunctions();
+  for (auto &F : MCM->funcs())
+    DT->translateRecursivelyAt(F->getStartAddr());
 
   std::unique_ptr<DCTranslatedInstTracker> DTIT;
   Module *M = DT->finalizeTranslationModule(&DTIT);
