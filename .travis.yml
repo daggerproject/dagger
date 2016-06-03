@@ -26,7 +26,7 @@ env:
 
 script:
   - mkdir build && cd build
-  - cmake .. -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
+  - cmake .. -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" -DLLVM_TARGETS_TO_BUILD="X86"
   - make -j3
   - ./bin/llvm-lit -v test/DC test/MC/Analysis test/tools/llvm-objdump
 
