@@ -42,6 +42,7 @@
 #include "llvm/Target/TargetRegisterInfo.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include <memory>
+#include <utility>
 
 using namespace llvm;
 
@@ -84,7 +85,7 @@ class UserValueScopes {
   SmallPtrSet<const MachineBasicBlock *, 4> LBlocks;
 
 public:
-  UserValueScopes(DebugLoc D, LexicalScopes &L) : DL(D), LS(L) {}
+  UserValueScopes(DebugLoc D, LexicalScopes &L) : DL(std::move(D)), LS(L) {}
 
   /// dominates - Return true if current scope dominates at least one machine
   /// instruction in a given machine basic block.
@@ -141,8 +142,8 @@ public:
   /// UserValue - Create a new UserValue.
   UserValue(const MDNode *var, const MDNode *expr, unsigned o, bool i,
             DebugLoc L, LocMap::Allocator &alloc)
-      : Variable(var), Expression(expr), offset(o), IsIndirect(i), dl(L),
-        leader(this), next(nullptr), locInts(alloc) {}
+      : Variable(var), Expression(expr), offset(o), IsIndirect(i),
+        dl(std::move(L)), leader(this), next(nullptr), locInts(alloc) {}
 
   /// getLeader - Get the leader of this value's equivalence class.
   UserValue *getLeader() {
@@ -520,9 +521,10 @@ bool LDVImpl::collectDebugValues(MachineFunction &mf) {
         continue;
       }
       // DBG_VALUE has no slot index, use the previous instruction instead.
-      SlotIndex Idx = MBBI == MBB->begin() ?
-        LIS->getMBBStartIdx(MBB) :
-        LIS->getInstructionIndex(std::prev(MBBI)).getRegSlot();
+      SlotIndex Idx =
+          MBBI == MBB->begin()
+              ? LIS->getMBBStartIdx(MBB)
+              : LIS->getInstructionIndex(*std::prev(MBBI)).getRegSlot();
       // Handle consecutive DBG_VALUE instructions with the same slot index.
       do {
         if (handleDebugValue(MBBI, Idx)) {
@@ -614,7 +616,7 @@ UserValue::addDefsFromCopies(LiveInterval *LI, unsigned LocNo,
 
     // Is LocNo extended to reach this copy? If not, another def may be blocking
     // it, or we are looking at a wrong value of LI.
-    SlotIndex Idx = LIS.getInstructionIndex(MI);
+    SlotIndex Idx = LIS.getInstructionIndex(*MI);
     LocMap::iterator I = locInts.find(Idx.getRegSlot(true));
     if (!I.valid() || I.value() != LocNo)
       continue;

@@ -7,9 +7,9 @@ define i64 addrspace(1)* @test(<2 x i64 addrspace(1)*> %vec, i32 %idx) gc "state
 ; CHECK: extractelement
 ; CHECK: statepoint
 ; CHECK: gc.relocate
-; CHECK-DAG: ; (%base_ee, %base_ee)
-; CHECK: gc.relocate
 ; CHECK-DAG: ; (%base_ee, %obj)
+; CHECK: gc.relocate
+; CHECK-DAG: ; (%base_ee, %base_ee)
 ; Note that the second extractelement is actually redundant here.  A correct output would
 ; be to reuse the existing obj as a base since it is actually a base pointer.
 entry:
@@ -45,10 +45,13 @@ untaken2:                                         ; preds = %merge
 
 merge2:                                           ; preds = %untaken2, %taken2
 ; CHECK-LABEL: merge2:
-; CHECK-NEXT: %obj = phi i64 addrspace(1)*
-; CHECK-NEXT: statepoint
+; CHECK: %obj.base = phi i64 addrspace(1)*
+; CHECK: %obj = phi i64 addrspace(1)*
+; CHECK: statepoint
 ; CHECK: gc.relocate
-; CHECK-DAG: ; (%obj, %obj)
+; CHECK-DAG: ; (%obj.base, %obj)
+; CHECK: gc.relocate
+; CHECK-DAG: ; (%obj.base, %obj.base)
   %obj = phi i64 addrspace(1)* [ %obj0, %taken2 ], [ %obj1, %untaken2 ]
   call void @do_safepoint() [ "deopt"() ]
   ret i64 addrspace(1)* %obj
@@ -60,7 +63,7 @@ define i64 addrspace(1)* @test3(i64 addrspace(1)* %ptr) gc "statepoint-example" 
 ; CHECK: extractelement
 ; CHECK: statepoint
 ; CHECK: gc.relocate
-; CHECK-DAG: (%obj, %obj)
+; CHECK-DAG: (%obj.base, %obj)
 entry:
   %vec = insertelement <2 x i64 addrspace(1)*> undef, i64 addrspace(1)* %ptr, i32 0
   %obj = extractelement <2 x i64 addrspace(1)*> %vec, i32 0
@@ -72,9 +75,7 @@ define i64 addrspace(1)* @test4(i64 addrspace(1)* %ptr) gc "statepoint-example" 
 ; CHECK-LABEL: test4
 ; CHECK: statepoint
 ; CHECK: gc.relocate
-; CHECK-DAG: ; (%ptr, %obj)
-; CHECK: gc.relocate
-; CHECK-DAG: ; (%ptr, %ptr)
+; CHECK-DAG: ; (%obj.base, %obj)
 ; When we can optimize an extractelement from a known
 ; index and avoid introducing new base pointer instructions
 entry:
@@ -91,7 +92,7 @@ declare void @use(i64 addrspace(1)*) "gc-leaf-function"
 define void @test5(i1 %cnd, i64 addrspace(1)* %obj) gc "statepoint-example" {
 ; CHECK-LABEL: @test5
 ; CHECK: gc.relocate
-; CHECK-DAG: (%obj, %bdv)
+; CHECK-DAG: (%bdv.base, %bdv)
 ; When we fundementally have to duplicate
 entry:
   %gep = getelementptr i64, i64 addrspace(1)* %obj, i64 1
@@ -105,7 +106,7 @@ entry:
 define void @test6(i1 %cnd, i64 addrspace(1)* %obj, i64 %idx) gc "statepoint-example" {
 ; CHECK-LABEL: @test6
 ; CHECK: %gep = getelementptr i64, i64 addrspace(1)* %obj, i64 1
-; CHECK: %vec.base = insertelement <2 x i64 addrspace(1)*> undef, i64 addrspace(1)* %obj, i32 0, !is_base_value !0
+; CHECK: %vec.base = insertelement <2 x i64 addrspace(1)*> zeroinitializer, i64 addrspace(1)* %obj, i32 0, !is_base_value !0
 ; CHECK: %vec = insertelement <2 x i64 addrspace(1)*> undef, i64 addrspace(1)* %gep, i32 0
 ; CHECK: %bdv.base = extractelement <2 x i64 addrspace(1)*> %vec.base, i64 %idx, !is_base_value !0
 ; CHECK:  %bdv = extractelement <2 x i64 addrspace(1)*> %vec, i64 %idx

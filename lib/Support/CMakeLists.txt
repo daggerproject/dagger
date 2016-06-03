@@ -17,13 +17,13 @@ elseif( CMAKE_HOST_UNIX )
   if( LLVM_ENABLE_THREADS AND HAVE_LIBATOMIC )
     set(system_libs ${system_libs} atomic)
   endif()
-  if( LLVM_ENABLE_THREADS AND HAVE_LIBPTHREAD )
-    set(system_libs ${system_libs} pthread)
-  endif()
+  set(system_libs ${system_libs} ${PTHREAD_LIB})
   if ( LLVM_ENABLE_ZLIB AND HAVE_LIBZ )
     set(system_libs ${system_libs} z)
   endif()
-  set(system_libs ${system_libs} m)
+  if( UNIX AND NOT (BEOS OR HAIKU) )
+    set(system_libs ${system_libs} m)
+  endif()
 endif( MSVC OR MINGW )
 
 add_llvm_library(LLVMSupport
@@ -35,6 +35,7 @@ add_llvm_library(LLVMSupport
   Allocator.cpp
   BlockFrequency.cpp
   BranchProbability.cpp
+  CachePruning.cpp
   circular_raw_ostream.cpp
   COM.cpp
   CommandLine.cpp
@@ -48,6 +49,7 @@ add_llvm_library(LLVMSupport
   DeltaAlgorithm.cpp
   DAGDeltaAlgorithm.cpp
   Dwarf.cpp
+  Error.cpp
   ErrorHandling.cpp
   FileUtilities.cpp
   FileOutputBuffer.cpp
@@ -74,6 +76,8 @@ add_llvm_library(LLVMSupport
   RandomNumberGenerator.cpp
   Regex.cpp
   ScaledNumber.cpp
+  ScopedPrinter.cpp
+  SHA1.cpp
   SmallPtrSet.cpp
   SmallVector.cpp
   SourceMgr.cpp

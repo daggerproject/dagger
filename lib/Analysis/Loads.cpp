@@ -21,7 +21,121 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/Statepoint.h"
+
 using namespace llvm;
+
+static bool isAligned(const Value *Base, APInt Offset, unsigned Align,
+                      const DataLayout &DL) {
+  APInt BaseAlign(Offset.getBitWidth(), Base->getPointerAlignment(DL));
+
+  if (!BaseAlign) {
+    Type *Ty = Base->getType()->getPointerElementType();
+    if (!Ty->isSized())
+      return false;
+    BaseAlign = DL.getABITypeAlignment(Ty);
+  }
+
+  APInt Alignment(Offset.getBitWidth(), Align);
+
+  assert(Alignment.isPowerOf2() && "must be a power of 2!");
+  return BaseAlign.uge(Alignment) && !(Offset & (Alignment-1));
+}
+
+static bool isAligned(const Value *Base, unsigned Align, const DataLayout &DL) {
+  Type *Ty = Base->getType();
+  assert(Ty->isSized() && "must be sized");
+  APInt Offset(DL.getTypeStoreSizeInBits(Ty), 0);
+  return isAligned(Base, Offset, Align, DL);
+}
+
+/// Test if V is always a pointer to allocated and suitably aligned memory for
+/// a simple load or store.
+static bool isDereferenceableAndAlignedPointer(
+    const Value *V, unsigned Align, APInt Size, const DataLayout &DL,
+    const Instruction *CtxI, const DominatorTree *DT,
+    const TargetLibraryInfo *TLI, SmallPtrSetImpl<const Value *> &Visited) {
+  // Note that it is not safe to speculate into a malloc'd region because
+  // malloc may return null.
+
+  // bitcast instructions are no-ops as far as dereferenceability is concerned.
+  if (const BitCastOperator *BC = dyn_cast<BitCastOperator>(V))
+    return isDereferenceableAndAlignedPointer(BC->getOperand(0), Align, Size,
+                                              DL, CtxI, DT, TLI, Visited);
+
+  bool CheckForNonNull = false;
+  APInt KnownDerefBytes(Size.getBitWidth(),
+                        V->getPointerDereferenceableBytes(DL, CheckForNonNull));
+  if (KnownDerefBytes.getBoolValue()) {
+    if (KnownDerefBytes.uge(Size))
+      if (!CheckForNonNull || isKnownNonNullAt(V, CtxI, DT, TLI))
+        return isAligned(V, Align, DL);
+  }
+
+  // For GEPs, determine if the indexing lands within the allocated object.
+  if (const GEPOperator *GEP = dyn_cast<GEPOperator>(V)) {
+    const Value *Base = GEP->getPointerOperand();
+
+    APInt Offset(DL.getPointerTypeSizeInBits(GEP->getType()), 0);
+    if (!GEP->accumulateConstantOffset(DL, Offset) || Offset.isNegative() ||
+        !Offset.urem(APInt(Offset.getBitWidth(), Align)).isMinValue())
+      return false;
+
+    // If the base pointer is dereferenceable for Offset+Size bytes, then the
+    // GEP (== Base + Offset) is dereferenceable for Size bytes.  If the base
+    // pointer is aligned to Align bytes, and the Offset is divisible by Align
+    // then the GEP (== Base + Offset == k_0 * Align + k_1 * Align) is also
+    // aligned to Align bytes.
+
+    return Visited.insert(Base).second &&
+           isDereferenceableAndAlignedPointer(Base, Align, Offset + Size, DL,
+                                              CtxI, DT, TLI, Visited);
+  }
+
+  // For gc.relocate, look through relocations
+  if (const GCRelocateInst *RelocateInst = dyn_cast<GCRelocateInst>(V))
+    return isDereferenceableAndAlignedPointer(
+        RelocateInst->getDerivedPtr(), Align, Size, DL, CtxI, DT, TLI, Visited);
+
+  if (const AddrSpaceCastInst *ASC = dyn_cast<AddrSpaceCastInst>(V))
+    return isDereferenceableAndAlignedPointer(ASC->getOperand(0), Align, Size,
+                                              DL, CtxI, DT, TLI, Visited);
+
+  // If we don't know, assume the worst.
+  return false;
+}
+
+bool llvm::isDereferenceableAndAlignedPointer(const Value *V, unsigned Align,
+                                              const DataLayout &DL,
+                                              const Instruction *CtxI,
+                                              const DominatorTree *DT,
+                                              const TargetLibraryInfo *TLI) {
+  // When dereferenceability information is provided by a dereferenceable
+  // attribute, we know exactly how many bytes are dereferenceable. If we can
+  // determine the exact offset to the attributed variable, we can use that
+  // information here.
+  Type *VTy = V->getType();
+  Type *Ty = VTy->getPointerElementType();
+
+  // Require ABI alignment for loads without alignment specification
+  if (Align == 0)
+    Align = DL.getABITypeAlignment(Ty);
+
+  if (!Ty->isSized())
+    return false;
+
+  SmallPtrSet<const Value *, 32> Visited;
+  return ::isDereferenceableAndAlignedPointer(
+      V, Align, APInt(DL.getTypeSizeInBits(VTy), DL.getTypeStoreSize(Ty)), DL,
+      CtxI, DT, TLI, Visited);
+}
+
+bool llvm::isDereferenceablePointer(const Value *V, const DataLayout &DL,
+                                    const Instruction *CtxI,
+                                    const DominatorTree *DT,
+                                    const TargetLibraryInfo *TLI) {
+  return isDereferenceableAndAlignedPointer(V, 1, DL, CtxI, DT, TLI);
+}
 
 /// \brief Test if A and B will obviously have the same value.
 ///
@@ -56,7 +170,8 @@ static bool AreEquivalentAddressValues(const Value *A, const Value *B) {
 
 /// \brief Check if executing a load of this pointer value cannot trap.
 ///
-/// If DT is specified this method performs context-sensitive analysis.
+/// If DT and ScanFrom are specified this method performs context-sensitive
+/// analysis and returns true if it is safe to load immediately before ScanFrom.
 ///
 /// If it is not obviously safe to load from the specified pointer, we do
 /// a quick local scan of the basic block containing \c ScanFrom, to determine
@@ -65,11 +180,10 @@ static bool AreEquivalentAddressValues(const Value *A, const Value *B) {
 /// This uses the pointee type to determine how many bytes need to be safe to
 /// load from the pointer.
 bool llvm::isSafeToLoadUnconditionally(Value *V, unsigned Align,
+                                       const DataLayout &DL,
                                        Instruction *ScanFrom,
                                        const DominatorTree *DT,
                                        const TargetLibraryInfo *TLI) {
-  const DataLayout &DL = ScanFrom->getModule()->getDataLayout();
-
   // Zero alignment means that the load has the ABI alignment for the target
   if (Align == 0)
     Align = DL.getABITypeAlignment(V->getType()->getPointerElementType());
@@ -95,9 +209,9 @@ bool llvm::isSafeToLoadUnconditionally(Value *V, unsigned Align,
     BaseAlign = AI->getAlignment();
   } else if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Base)) {
     // Global variables are not necessarily safe to load from if they are
-    // overridden. Their size may change or they may be weak and require a test
-    // to determine if they were in fact provided.
-    if (!GV->mayBeOverridden()) {
+    // interposed arbitrarily. Their size may change or they may be weak and
+    // require a test to determine if they were in fact provided.
+    if (!GV->isInterposable()) {
       BaseType = GV->getType()->getElementType();
       BaseAlign = GV->getAlignment();
     }
@@ -121,6 +235,9 @@ bool llvm::isSafeToLoadUnconditionally(Value *V, unsigned Align,
         return true;
     }
   }
+
+  if (!ScanFrom)
+    return false;
 
   // Otherwise, be a little bit aggressive by scanning the local block where we
   // want to check to see if the pointer is already being loaded or stored
@@ -212,6 +329,14 @@ Value *llvm::FindAvailableLoadedValue(LoadInst *Load, BasicBlock *ScanBB,
   Value *Ptr = Load->getPointerOperand();
   Type *AccessTy = Load->getType();
 
+  // We can never remove a volatile load
+  if (Load->isVolatile())
+    return nullptr;
+
+  // Anything stronger than unordered is currently unimplemented.
+  if (!Load->isUnordered())
+    return nullptr;
+
   const DataLayout &DL = ScanBB->getModule()->getDataLayout();
 
   // Try to get the store size for the type.
@@ -241,6 +366,12 @@ Value *llvm::FindAvailableLoadedValue(LoadInst *Load, BasicBlock *ScanBB,
       if (AreEquivalentAddressValues(
               LI->getPointerOperand()->stripPointerCasts(), StrippedPtr) &&
           CastInst::isBitOrNoopPointerCastable(LI->getType(), AccessTy, DL)) {
+
+        // We can value forward from an atomic to a non-atomic, but not the
+        // other way around.
+        if (LI->isAtomic() < Load->isAtomic())
+          return nullptr;
+
         if (AATags)
           LI->getAAMetadata(*AATags);
         return LI;
@@ -254,6 +385,12 @@ Value *llvm::FindAvailableLoadedValue(LoadInst *Load, BasicBlock *ScanBB,
       if (AreEquivalentAddressValues(StorePtr, StrippedPtr) &&
           CastInst::isBitOrNoopPointerCastable(SI->getValueOperand()->getType(),
                                                AccessTy, DL)) {
+
+        // We can value forward from an atomic to a non-atomic, but not the
+        // other way around.
+        if (SI->isAtomic() < Load->isAtomic())
+          return nullptr;
+
         if (AATags)
           SI->getAAMetadata(*AATags);
         return SI->getOperand(0);

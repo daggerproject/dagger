@@ -183,11 +183,11 @@ public:
                   MachineBasicBlock::iterator MI) const override;
 
   /// Returns true if the instruction is already predicated.
-  bool isPredicated(const MachineInstr *MI) const override;
+  bool isPredicated(const MachineInstr &MI) const override;
 
   /// Convert the instruction into a predicated instruction.
   /// It returns true if the operation was successful.
-  bool PredicateInstruction(MachineInstr *MI,
+  bool PredicateInstruction(MachineInstr &MI,
                             ArrayRef<MachineOperand> Cond) const override;
 
   /// Returns true if the first specified predicate
@@ -198,13 +198,13 @@ public:
   /// If the specified instruction defines any predicate
   /// or condition code register(s) used for predication, returns true as well
   /// as the definition predicate(s) by reference.
-  bool DefinesPredicate(MachineInstr *MI,
+  bool DefinesPredicate(MachineInstr &MI,
                         std::vector<MachineOperand> &Pred) const override;
 
   /// Return true if the specified instruction can be predicated.
   /// By default, this returns true for every instruction with a
   /// PredicateOperand.
-  bool isPredicable(MachineInstr *MI) const override;
+  bool isPredicable(MachineInstr &MI) const override;
 
   /// Test if the given instruction should be considered a scheduling boundary.
   /// This primarily includes labels and terminators.
@@ -301,9 +301,9 @@ public:
   bool isNewValueStore(unsigned Opcode) const;
   bool isOperandExtended(const MachineInstr *MI, unsigned OperandNum) const;
   bool isPostIncrement(const MachineInstr* MI) const;
-  bool isPredicatedNew(const MachineInstr *MI) const;
+  bool isPredicatedNew(const MachineInstr &MI) const;
   bool isPredicatedNew(unsigned Opcode) const;
-  bool isPredicatedTrue(const MachineInstr *MI) const;
+  bool isPredicatedTrue(const MachineInstr &MI) const;
   bool isPredicatedTrue(unsigned Opcode) const;
   bool isPredicated(unsigned Opcode) const;
   bool isPredicateLate(unsigned Opcode) const;
@@ -343,11 +343,15 @@ public:
   bool predOpcodeHasNot(ArrayRef<MachineOperand> Cond) const;
 
 
+  short getAbsoluteForm(const MachineInstr *MI) const;
   unsigned getAddrMode(const MachineInstr* MI) const;
   unsigned getBaseAndOffset(const MachineInstr *MI, int &Offset,
                             unsigned &AccessSize) const;
   bool getBaseAndOffsetPosition(const MachineInstr *MI, unsigned &BasePos,
                                 unsigned &OffsetPos) const;
+  short getBaseWithLongOffset(short Opcode) const;
+  short getBaseWithLongOffset(const MachineInstr *MI) const;
+  short getBaseWithRegOffset(const MachineInstr *MI) const;
   SmallVector<MachineInstr*,2> getBranchingInstrs(MachineBasicBlock& MBB) const;
   unsigned getCExtOpNum(const MachineInstr *MI) const;
   HexagonII::CompoundGroup
@@ -397,6 +401,7 @@ public:
   bool reversePredSense(MachineInstr* MI) const;
   unsigned reversePrediction(unsigned Opcode) const;
   bool validateBranchCond(const ArrayRef<MachineOperand> &Cond) const;
+  short xformRegToImmOffset(const MachineInstr *MI) const;
 };
 
 }

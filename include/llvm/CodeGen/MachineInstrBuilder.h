@@ -230,7 +230,7 @@ public:
 
   /// Copy all the implicit operands from OtherMI onto this one.
   const MachineInstrBuilder &
-  copyImplicitOps(const MachineInstr *OtherMI) const {
+  copyImplicitOps(const MachineInstr &OtherMI) const {
     MI->copyImplicitOps(*MF, OtherMI);
     return *this;
   }
@@ -350,47 +350,19 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock *BB,
 /// for either a value in a register or a register-indirect+offset
 /// address.  The convention is that a DBG_VALUE is indirect iff the
 /// second operand is an immediate.
-inline MachineInstrBuilder BuildMI(MachineFunction &MF, DebugLoc DL,
-                                   const MCInstrDesc &MCID, bool IsIndirect,
-                                   unsigned Reg, unsigned Offset,
-                                   const MDNode *Variable, const MDNode *Expr) {
-  assert(isa<DILocalVariable>(Variable) && "not a variable");
-  assert(cast<DIExpression>(Expr)->isValid() && "not an expression");
-  assert(cast<DILocalVariable>(Variable)->isValidLocationForIntrinsic(DL) &&
-         "Expected inlined-at fields to agree");
-  if (IsIndirect)
-    return BuildMI(MF, DL, MCID)
-        .addReg(Reg, RegState::Debug)
-        .addImm(Offset)
-        .addMetadata(Variable)
-        .addMetadata(Expr);
-  else {
-    assert(Offset == 0 && "A direct address cannot have an offset.");
-    return BuildMI(MF, DL, MCID)
-        .addReg(Reg, RegState::Debug)
-        .addReg(0U, RegState::Debug)
-        .addMetadata(Variable)
-        .addMetadata(Expr);
-  }
-}
+MachineInstrBuilder BuildMI(MachineFunction &MF, DebugLoc DL,
+                            const MCInstrDesc &MCID, bool IsIndirect,
+                            unsigned Reg, unsigned Offset,
+                            const MDNode *Variable, const MDNode *Expr);
 
 /// This version of the builder builds a DBG_VALUE intrinsic
 /// for either a value in a register or a register-indirect+offset
 /// address and inserts it at position I.
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
-                                   MachineBasicBlock::iterator I, DebugLoc DL,
-                                   const MCInstrDesc &MCID, bool IsIndirect,
-                                   unsigned Reg, unsigned Offset,
-                                   const MDNode *Variable, const MDNode *Expr) {
-  assert(isa<DILocalVariable>(Variable) && "not a variable");
-  assert(cast<DIExpression>(Expr)->isValid() && "not an expression");
-  MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI =
-      BuildMI(MF, DL, MCID, IsIndirect, Reg, Offset, Variable, Expr);
-  BB.insert(I, MI);
-  return MachineInstrBuilder(MF, MI);
-}
-
+MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
+                            MachineBasicBlock::iterator I, DebugLoc DL,
+                            const MCInstrDesc &MCID, bool IsIndirect,
+                            unsigned Reg, unsigned Offset,
+                            const MDNode *Variable, const MDNode *Expr);
 
 inline unsigned getDefRegState(bool B) {
   return B ? RegState::Define : 0;
@@ -414,6 +386,17 @@ inline unsigned getDebugRegState(bool B) {
   return B ? RegState::Debug : 0;
 }
 
+/// Get all register state flags from machine operand \p RegOp.
+inline unsigned getRegState(const MachineOperand &RegOp) {
+  assert(RegOp.isReg() && "Not a register operand");
+  return getDefRegState(RegOp.isDef())                    |
+         getImplRegState(RegOp.isImplicit())              |
+         getKillRegState(RegOp.isKill())                  |
+         getDeadRegState(RegOp.isDead())                  |
+         getUndefRegState(RegOp.isUndef())                |
+         getInternalReadRegState(RegOp.isInternalRead())  |
+         getDebugRegState(RegOp.isDebug());
+}
 
 /// Helper class for constructing bundles of MachineInstrs.
 ///
@@ -428,28 +411,26 @@ class MIBundleBuilder {
 public:
   /// Create an MIBundleBuilder that inserts instructions into a new bundle in
   /// BB above the bundle or instruction at Pos.
-  MIBundleBuilder(MachineBasicBlock &BB,
-                  MachineBasicBlock::iterator Pos)
-    : MBB(BB), Begin(Pos.getInstrIterator()), End(Begin) {}
+  MIBundleBuilder(MachineBasicBlock &BB, MachineBasicBlock::iterator Pos)
+      : MBB(BB), Begin(Pos.getInstrIterator()), End(Begin) {}
 
   /// Create a bundle from the sequence of instructions between B and E.
-  MIBundleBuilder(MachineBasicBlock &BB,
-                  MachineBasicBlock::iterator B,
+  MIBundleBuilder(MachineBasicBlock &BB, MachineBasicBlock::iterator B,
                   MachineBasicBlock::iterator E)
-    : MBB(BB), Begin(B.getInstrIterator()), End(E.getInstrIterator()) {
+      : MBB(BB), Begin(B.getInstrIterator()), End(E.getInstrIterator()) {
     assert(B != E && "No instructions to bundle");
     ++B;
     while (B != E) {
-      MachineInstr *MI = B;
+      MachineInstr &MI = *B;
       ++B;
-      MI->bundleWithPred();
+      MI.bundleWithPred();
     }
   }
 
   /// Create an MIBundleBuilder representing an existing instruction or bundle
   /// that has MI as its head.
   explicit MIBundleBuilder(MachineInstr *MI)
-    : MBB(*MI->getParent()), Begin(MI), End(getBundleEnd(MI)) {}
+      : MBB(*MI->getParent()), Begin(MI), End(getBundleEnd(*MI)) {}
 
   /// Return a reference to the basic block containing this bundle.
   MachineBasicBlock &getMBB() const { return MBB; }
@@ -472,7 +453,7 @@ public:
     if (I == Begin) {
       if (!empty())
         MI->bundleWithSucc();
-      Begin = MI->getInstrIterator();
+      Begin = MI->getIterator();
       return *this;
     }
     if (I == End) {

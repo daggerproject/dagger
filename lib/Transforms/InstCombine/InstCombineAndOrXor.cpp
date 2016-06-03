@@ -465,11 +465,9 @@ static unsigned getTypeOfMaskedICmp(Value* A, Value* B, Value* C,
   if (CCst && CCst->isZero()) {
     // if C is zero, then both A and B qualify as mask
     result |= (icmp_eq ? (FoldMskICmp_Mask_AllZeroes |
-                          FoldMskICmp_Mask_AllZeroes |
                           FoldMskICmp_AMask_Mixed |
                           FoldMskICmp_BMask_Mixed)
                        : (FoldMskICmp_Mask_NotAllZeroes |
-                          FoldMskICmp_Mask_NotAllZeroes |
                           FoldMskICmp_AMask_NotMixed |
                           FoldMskICmp_BMask_NotMixed));
     if (icmp_abit)
@@ -666,7 +664,7 @@ static unsigned foldLogOpOfMaskedICmpsHelper(Value*& A,
   if (!ICmpInst::isEquality(RHSCC))
     return 0;
 
-  // Look for ANDs in on the right side of the RHS icmp.
+  // Look for ANDs on the right side of the RHS icmp.
   if (!ok && R2->getType()->isIntegerTy()) {
     if (!match(R2, m_And(m_Value(R11), m_Value(R12)))) {
       R11 = R2;
@@ -1243,6 +1241,119 @@ static Instruction *matchDeMorgansLaws(BinaryOperator &I,
   return nullptr;
 }
 
+Instruction *InstCombiner::foldCastedBitwiseLogic(BinaryOperator &I) {
+  auto LogicOpc = I.getOpcode();
+  assert((LogicOpc == Instruction::And || LogicOpc == Instruction::Or ||
+          LogicOpc == Instruction::Xor) &&
+         "Unexpected opcode for bitwise logic folding");
+
+  Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
+  CastInst *Cast0 = dyn_cast<CastInst>(Op0);
+  if (!Cast0)
+    return nullptr;
+
+  // This must be a cast from an integer or integer vector source type to allow
+  // transformation of the logic operation to the source type.
+  Type *DestTy = I.getType();
+  Type *SrcTy = Cast0->getSrcTy();
+  if (!SrcTy->isIntOrIntVectorTy())
+    return nullptr;
+
+  // If one operand is a bitcast and the other is a constant, move the logic
+  // operation ahead of the bitcast. That is, do the logic operation in the
+  // original type. This can eliminate useless bitcasts and allow normal
+  // combines that would otherwise be impeded by the bitcast. Canonicalization
+  // ensures that if there is a constant operand, it will be the second operand.
+  Value *BC = nullptr;
+  Constant *C = nullptr;
+  if ((match(Op0, m_BitCast(m_Value(BC))) && match(Op1, m_Constant(C)))) {
+    // A bitcast of a constant will be removed.
+    Value *NewConstant = Builder->CreateBitCast(C, SrcTy);
+    Value *NewOp = Builder->CreateBinOp(LogicOpc, BC, NewConstant, I.getName());
+    return CastInst::CreateBitOrPointerCast(NewOp, DestTy);
+  }
+
+  CastInst *Cast1 = dyn_cast<CastInst>(Op1);
+  if (!Cast1)
+    return nullptr;
+
+  // Both operands of the logic operation are casts. The casts must be of the
+  // same type for reduction.
+  auto CastOpcode = Cast0->getOpcode();
+  if (CastOpcode != Cast1->getOpcode() || SrcTy != Cast1->getSrcTy())
+    return nullptr;
+
+  Value *Cast0Src = Cast0->getOperand(0);
+  Value *Cast1Src = Cast1->getOperand(0);
+
+  // fold (logic (cast A), (cast B)) -> (cast (logic A, B))
+
+  // Only do this if the casts both really cause code to be generated.
+  if ((!isa<ICmpInst>(Cast0Src) || !isa<ICmpInst>(Cast1Src)) &&
+      ShouldOptimizeCast(CastOpcode, Cast0Src, DestTy) &&
+      ShouldOptimizeCast(CastOpcode, Cast1Src, DestTy)) {
+    Value *NewOp = Builder->CreateBinOp(LogicOpc, Cast0Src, Cast1Src,
+                                        I.getName());
+    return CastInst::Create(CastOpcode, NewOp, DestTy);
+  }
+
+  // For now, only 'and'/'or' have optimizations after this.
+  if (LogicOpc == Instruction::Xor)
+    return nullptr;
+
+  // If this is logic(cast(icmp), cast(icmp)), try to fold this even if the
+  // cast is otherwise not optimizable.  This happens for vector sexts.
+  ICmpInst *ICmp0 = dyn_cast<ICmpInst>(Cast0Src);
+  ICmpInst *ICmp1 = dyn_cast<ICmpInst>(Cast1Src);
+  if (ICmp0 && ICmp1) {
+    Value *Res = LogicOpc == Instruction::And ? FoldAndOfICmps(ICmp0, ICmp1)
+                                              : FoldOrOfICmps(ICmp0, ICmp1, &I);
+    if (Res)
+      return CastInst::Create(CastOpcode, Res, DestTy);
+    return nullptr;
+  }
+
+  // If this is logic(cast(fcmp), cast(fcmp)), try to fold this even if the
+  // cast is otherwise not optimizable.  This happens for vector sexts.
+  FCmpInst *FCmp0 = dyn_cast<FCmpInst>(Cast0Src);
+  FCmpInst *FCmp1 = dyn_cast<FCmpInst>(Cast1Src);
+  if (FCmp0 && FCmp1) {
+    Value *Res = LogicOpc == Instruction::And ? FoldAndOfFCmps(FCmp0, FCmp1)
+                                              : FoldOrOfFCmps(FCmp0, FCmp1);
+    if (Res)
+      return CastInst::Create(CastOpcode, Res, DestTy);
+    return nullptr;
+  }
+
+  return nullptr;
+}
+
+static Instruction *foldBoolSextMaskToSelect(BinaryOperator &I) {
+  Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
+
+  // Canonicalize SExt or Not to the LHS
+  if (match(Op1, m_SExt(m_Value())) || match(Op1, m_Not(m_Value()))) {
+    std::swap(Op0, Op1);
+  }
+
+  // Fold (and (sext bool to A), B) --> (select bool, B, 0)
+  Value *X = nullptr;
+  if (match(Op0, m_SExt(m_Value(X))) &&
+      X->getType()->getScalarType()->isIntegerTy(1)) {
+    Value *Zero = Constant::getNullValue(Op1->getType());
+    return SelectInst::Create(X, Op1, Zero);
+  }
+
+  // Fold (and ~(sext bool to A), B) --> (select bool, 0, B)
+  if (match(Op0, m_Not(m_SExt(m_Value(X)))) &&
+      X->getType()->getScalarType()->isIntegerTy(1)) {
+    Value *Zero = Constant::getNullValue(Op0->getType());
+    return SelectInst::Create(X, Zero, Op1);
+  }
+  
+  return nullptr;
+}
+
 Instruction *InstCombiner::visitAnd(BinaryOperator &I) {
   bool Changed = SimplifyAssociativeOrCommutative(I);
   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
@@ -1480,90 +1591,44 @@ Instruction *InstCombiner::visitAnd(BinaryOperator &I) {
       if (Value *Res = FoldAndOfFCmps(LHS, RHS))
         return replaceInstUsesWith(I, Res);
 
+  if (Instruction *CastedAnd = foldCastedBitwiseLogic(I))
+    return CastedAnd;
 
-  if (CastInst *Op0C = dyn_cast<CastInst>(Op0)) {
-    Value *Op0COp = Op0C->getOperand(0);
-    Type *SrcTy = Op0COp->getType();
-    // fold (and (cast A), (cast B)) -> (cast (and A, B))
-    if (CastInst *Op1C = dyn_cast<CastInst>(Op1)) {
-      if (Op0C->getOpcode() == Op1C->getOpcode() && // same cast kind ?
-          SrcTy == Op1C->getOperand(0)->getType() &&
-          SrcTy->isIntOrIntVectorTy()) {
-        Value *Op1COp = Op1C->getOperand(0);
-
-        // Only do this if the casts both really cause code to be generated.
-        if (ShouldOptimizeCast(Op0C->getOpcode(), Op0COp, I.getType()) &&
-            ShouldOptimizeCast(Op1C->getOpcode(), Op1COp, I.getType())) {
-          Value *NewOp = Builder->CreateAnd(Op0COp, Op1COp, I.getName());
-          return CastInst::Create(Op0C->getOpcode(), NewOp, I.getType());
-        }
-
-        // If this is and(cast(icmp), cast(icmp)), try to fold this even if the
-        // cast is otherwise not optimizable.  This happens for vector sexts.
-        if (ICmpInst *RHS = dyn_cast<ICmpInst>(Op1COp))
-          if (ICmpInst *LHS = dyn_cast<ICmpInst>(Op0COp))
-            if (Value *Res = FoldAndOfICmps(LHS, RHS))
-              return CastInst::Create(Op0C->getOpcode(), Res, I.getType());
-
-        // If this is and(cast(fcmp), cast(fcmp)), try to fold this even if the
-        // cast is otherwise not optimizable.  This happens for vector sexts.
-        if (FCmpInst *RHS = dyn_cast<FCmpInst>(Op1COp))
-          if (FCmpInst *LHS = dyn_cast<FCmpInst>(Op0COp))
-            if (Value *Res = FoldAndOfFCmps(LHS, RHS))
-              return CastInst::Create(Op0C->getOpcode(), Res, I.getType());
-      }
-    }
-
-    // If we are masking off the sign bit of a floating-point value, convert
-    // this to the canonical fabs intrinsic call and cast back to integer.
-    // The backend should know how to optimize fabs().
-    // TODO: This transform should also apply to vectors.
-    ConstantInt *CI;
-    if (isa<BitCastInst>(Op0C) && SrcTy->isFloatingPointTy() &&
-        match(Op1, m_ConstantInt(CI)) && CI->isMaxValue(true)) {
-      Module *M = I.getModule();
-      Function *Fabs = Intrinsic::getDeclaration(M, Intrinsic::fabs, SrcTy);
-      Value *Call = Builder->CreateCall(Fabs, Op0COp, "fabs");
-      return CastInst::CreateBitOrPointerCast(Call, I.getType());
-    }
-  }
-
-  {
-    Value *X = nullptr;
-    bool OpsSwapped = false;
-    // Canonicalize SExt or Not to the LHS
-    if (match(Op1, m_SExt(m_Value())) ||
-        match(Op1, m_Not(m_Value()))) {
-      std::swap(Op0, Op1);
-      OpsSwapped = true;
-    }
-
-    // Fold (and (sext bool to A), B) --> (select bool, B, 0)
-    if (match(Op0, m_SExt(m_Value(X))) &&
-        X->getType()->getScalarType()->isIntegerTy(1)) {
-      Value *Zero = Constant::getNullValue(Op1->getType());
-      return SelectInst::Create(X, Op1, Zero);
-    }
-
-    // Fold (and ~(sext bool to A), B) --> (select bool, 0, B)
-    if (match(Op0, m_Not(m_SExt(m_Value(X)))) &&
-        X->getType()->getScalarType()->isIntegerTy(1)) {
-      Value *Zero = Constant::getNullValue(Op0->getType());
-      return SelectInst::Create(X, Zero, Op1);
-    }
-
-    if (OpsSwapped)
-      std::swap(Op0, Op1);
-  }
+  if (Instruction *Select = foldBoolSextMaskToSelect(I))
+    return Select;
 
   return Changed ? &I : nullptr;
 }
 
-/// Given an OR instruction, check to see if this is a bswap or bitreverse
-/// idiom. If so, insert the new intrinsic and return it.
-Instruction *InstCombiner::MatchBSwapOrBitReverse(BinaryOperator &I) {
+/// Given an OR instruction, check to see if this is a bswap idiom. If so,
+/// insert the new intrinsic and return it.
+Instruction *InstCombiner::MatchBSwap(BinaryOperator &I) {
+  Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
+
+  // Look through zero extends.
+  if (Instruction *Ext = dyn_cast<ZExtInst>(Op0))
+    Op0 = Ext->getOperand(0);
+
+  if (Instruction *Ext = dyn_cast<ZExtInst>(Op1))
+    Op1 = Ext->getOperand(0);
+
+  // (A | B) | C  and  A | (B | C)                  -> bswap if possible.
+  bool OrOfOrs = match(Op0, m_Or(m_Value(), m_Value())) ||
+                 match(Op1, m_Or(m_Value(), m_Value()));
+
+  // (A >> B) | (C << D)  and  (A << B) | (B >> C)  -> bswap if possible.
+  bool OrOfShifts = match(Op0, m_LogicalShift(m_Value(), m_Value())) &&
+                    match(Op1, m_LogicalShift(m_Value(), m_Value()));
+
+  // (A & B) | (C & D)                              -> bswap if possible.
+  bool OrOfAnds = match(Op0, m_And(m_Value(), m_Value())) &&
+                  match(Op1, m_And(m_Value(), m_Value()));
+
+  if (!OrOfOrs && !OrOfShifts && !OrOfAnds)
+    return nullptr;
+
   SmallVector<Instruction*, 4> Insts;
-  if (!recognizeBitReverseOrBSwapIdiom(&I, true, false, Insts))
+  if (!recognizeBSwapOrBitReverseIdiom(&I, true, false, Insts))
     return nullptr;
   Instruction *LastInst = Insts.pop_back_val();
   LastInst->removeFromParent();
@@ -1576,12 +1641,11 @@ Instruction *InstCombiner::MatchBSwapOrBitReverse(BinaryOperator &I) {
 /// We have an expression of the form (A&C)|(B&D).  Check if A is (cond?-1:0)
 /// and either B or D is ~(cond?-1,0) or (cond?0,-1), then we can simplify this
 /// expression to "cond ? C : D or B".
-static Instruction *MatchSelectFromAndOr(Value *A, Value *B,
+static Instruction *matchSelectFromAndOr(Value *A, Value *B,
                                          Value *C, Value *D) {
   // If A is not a select of -1/0, this cannot match.
   Value *Cond = nullptr;
-  if (!match(A, m_SExt(m_Value(Cond))) ||
-      !Cond->getType()->isIntegerTy(1))
+  if (!match(A, m_SExt(m_Value(Cond))) || !Cond->getType()->isIntegerTy(1))
     return nullptr;
 
   // ((cond?-1:0)&C) | (B&(cond?0:-1)) -> cond ? C : B.
@@ -1595,6 +1659,7 @@ static Instruction *MatchSelectFromAndOr(Value *A, Value *B,
     return SelectInst::Create(Cond, C, D);
   if (match(B, m_SExt(m_Not(m_Specific(Cond)))))
     return SelectInst::Create(Cond, C, D);
+
   return nullptr;
 }
 
@@ -2104,22 +2169,12 @@ Instruction *InstCombiner::visitOr(BinaryOperator &I) {
         return NV;
   }
 
+  // Given an OR instruction, check to see if this is a bswap.
+  if (Instruction *BSwap = MatchBSwap(I))
+    return BSwap;
+
   Value *A = nullptr, *B = nullptr;
   ConstantInt *C1 = nullptr, *C2 = nullptr;
-
-  // (A | B) | C  and  A | (B | C)                  -> bswap if possible.
-  bool OrOfOrs = match(Op0, m_Or(m_Value(), m_Value())) ||
-                 match(Op1, m_Or(m_Value(), m_Value()));
-  // (A >> B) | (C << D)  and  (A << B) | (B >> C)  -> bswap if possible.
-  bool OrOfShifts = match(Op0, m_LogicalShift(m_Value(), m_Value())) &&
-                    match(Op1, m_LogicalShift(m_Value(), m_Value()));
-  // (A & B) | (C & D)                              -> bswap if possible.
-  bool OrOfAnds = match(Op0, m_And(m_Value(), m_Value())) &&
-                  match(Op1, m_And(m_Value(), m_Value()));
-
-  if (OrOfOrs || OrOfShifts || OrOfAnds)
-    if (Instruction *BSwap = MatchBSwapOrBitReverse(I))
-      return BSwap;
 
   // (X^C)|Y -> (X|Y)^C iff Y&C == 0
   if (Op0->hasOneUse() &&
@@ -2201,18 +2256,14 @@ Instruction *InstCombiner::visitOr(BinaryOperator &I) {
     }
 
     // (A & (C0?-1:0)) | (B & ~(C0?-1:0)) ->  C0 ? A : B, and commuted variants.
-    // Don't do this for vector select idioms, the code generator doesn't handle
-    // them well yet.
-    if (!I.getType()->isVectorTy()) {
-      if (Instruction *Match = MatchSelectFromAndOr(A, B, C, D))
-        return Match;
-      if (Instruction *Match = MatchSelectFromAndOr(B, A, D, C))
-        return Match;
-      if (Instruction *Match = MatchSelectFromAndOr(C, B, A, D))
-        return Match;
-      if (Instruction *Match = MatchSelectFromAndOr(D, A, B, C))
-        return Match;
-    }
+    if (Instruction *Match = matchSelectFromAndOr(A, B, C, D))
+      return Match;
+    if (Instruction *Match = matchSelectFromAndOr(B, A, D, C))
+      return Match;
+    if (Instruction *Match = matchSelectFromAndOr(C, B, A, D))
+      return Match;
+    if (Instruction *Match = matchSelectFromAndOr(D, A, B, C))
+      return Match;
 
     // ((A&~B)|(~A&B)) -> A^B
     if ((match(C, m_Not(m_Specific(D))) &&
@@ -2364,40 +2415,8 @@ Instruction *InstCombiner::visitOr(BinaryOperator &I) {
       if (Value *Res = FoldOrOfFCmps(LHS, RHS))
         return replaceInstUsesWith(I, Res);
 
-  // fold (or (cast A), (cast B)) -> (cast (or A, B))
-  if (CastInst *Op0C = dyn_cast<CastInst>(Op0)) {
-    CastInst *Op1C = dyn_cast<CastInst>(Op1);
-    if (Op1C && Op0C->getOpcode() == Op1C->getOpcode()) {// same cast kind ?
-      Type *SrcTy = Op0C->getOperand(0)->getType();
-      if (SrcTy == Op1C->getOperand(0)->getType() &&
-          SrcTy->isIntOrIntVectorTy()) {
-        Value *Op0COp = Op0C->getOperand(0), *Op1COp = Op1C->getOperand(0);
-
-        if ((!isa<ICmpInst>(Op0COp) || !isa<ICmpInst>(Op1COp)) &&
-            // Only do this if the casts both really cause code to be
-            // generated.
-            ShouldOptimizeCast(Op0C->getOpcode(), Op0COp, I.getType()) &&
-            ShouldOptimizeCast(Op1C->getOpcode(), Op1COp, I.getType())) {
-          Value *NewOp = Builder->CreateOr(Op0COp, Op1COp, I.getName());
-          return CastInst::Create(Op0C->getOpcode(), NewOp, I.getType());
-        }
-
-        // If this is or(cast(icmp), cast(icmp)), try to fold this even if the
-        // cast is otherwise not optimizable.  This happens for vector sexts.
-        if (ICmpInst *RHS = dyn_cast<ICmpInst>(Op1COp))
-          if (ICmpInst *LHS = dyn_cast<ICmpInst>(Op0COp))
-            if (Value *Res = FoldOrOfICmps(LHS, RHS, &I))
-              return CastInst::Create(Op0C->getOpcode(), Res, I.getType());
-
-        // If this is or(cast(fcmp), cast(fcmp)), try to fold this even if the
-        // cast is otherwise not optimizable.  This happens for vector sexts.
-        if (FCmpInst *RHS = dyn_cast<FCmpInst>(Op1COp))
-          if (FCmpInst *LHS = dyn_cast<FCmpInst>(Op0COp))
-            if (Value *Res = FoldOrOfFCmps(LHS, RHS))
-              return CastInst::Create(Op0C->getOpcode(), Res, I.getType());
-      }
-    }
-  }
+  if (Instruction *CastedOr = foldCastedBitwiseLogic(I))
+    return CastedOr;
 
   // or(sext(A), B) -> A ? -1 : B where A is an i1
   // or(A, sext(B)) -> B ? -1 : A where B is an i1
@@ -2730,23 +2749,8 @@ Instruction *InstCombiner::visitXor(BinaryOperator &I) {
         }
       }
 
-  // fold (xor (cast A), (cast B)) -> (cast (xor A, B))
-  if (CastInst *Op0C = dyn_cast<CastInst>(Op0)) {
-    if (CastInst *Op1C = dyn_cast<CastInst>(Op1))
-      if (Op0C->getOpcode() == Op1C->getOpcode()) { // same cast kind?
-        Type *SrcTy = Op0C->getOperand(0)->getType();
-        if (SrcTy == Op1C->getOperand(0)->getType() && SrcTy->isIntegerTy() &&
-            // Only do this if the casts both really cause code to be generated.
-            ShouldOptimizeCast(Op0C->getOpcode(), Op0C->getOperand(0),
-                               I.getType()) &&
-            ShouldOptimizeCast(Op1C->getOpcode(), Op1C->getOperand(0),
-                               I.getType())) {
-          Value *NewOp = Builder->CreateXor(Op0C->getOperand(0),
-                                            Op1C->getOperand(0), I.getName());
-          return CastInst::Create(Op0C->getOpcode(), NewOp, I.getType());
-        }
-      }
-  }
+  if (Instruction *CastedXor = foldCastedBitwiseLogic(I))
+    return CastedXor;
 
   return Changed ? &I : nullptr;
 }

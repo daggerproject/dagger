@@ -25,8 +25,9 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
-#include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCAnalysis/MCFunction.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 
@@ -37,6 +38,13 @@ EnableRegSetDiff("enable-dc-regset-diff", cl::desc(""), cl::init(false));
 
 static cl::opt<bool> EnableInstAddrSave("enable-dc-pc-save", cl::desc(""),
                                         cl::init(false));
+
+static cl::opt<bool> TranslateUnknownToUndef(
+    "dc-translate-unknown-to-undef",
+    cl::desc("Translate unknown instruction or unknown opcode in an "
+             "instruction's semantics with undef+unreachable. If false, "
+             "abort."),
+    cl::init(false));
 
 DCInstrSema::DCInstrSema(const unsigned *OpcodeToSemaIdx,
                          const unsigned *SemanticsArray,
@@ -102,9 +110,7 @@ Function *DCInstrSema::getOrCreateMainFunction(Function *EntryFn) {
       Builder->CreateAlloca(ArrayType::get(Builder->getInt8Ty(), kStackSize));
 
   // 64byte alignment ought to be enough for anybody.
-  // FIXME: this should probably be the maximum natural alignment of the
-  // non-int-coerced register types. As it is, large integer types are only
-  // aligned to the size of the largest legal integer, which isn't enough.
+  // FIXME: this should be the maximum natural alignment of the register types.
   Regset->setAlignment(64);
   Stack->setAlignment(64);
 
@@ -397,8 +403,17 @@ DCInstrSema::translateInst(const MCDecodedInst &DecodedInst,
 
   Idx = OpcodeToSemaIdx[CurrentInst->Inst.getOpcode()];
   if (!translateTargetInst()) {
-    if (Idx == 0)
-      return false;
+    if (Idx == ~0U) {
+      if (!TranslateUnknownToUndef)
+        return false;
+      errs() << "Couldn't translate instruction: \n  ";
+      errs() << "  " << DRS.MII.getName(CurrentInst->Inst.getOpcode()) << ": "
+             << CurrentInst->Inst << "\n";
+      Builder->CreateCall(
+          Intrinsic::getDeclaration(TheModule, Intrinsic::trap));
+      Builder->CreateUnreachable();
+      return true;
+    }
 
     {
       // Increment the PC before anything.
@@ -552,16 +567,15 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
     unsigned MIOperandNo = Next();
     unsigned RegNo = getRegOp(MIOperandNo);
     Value *Res = getNextOperand();
-    Type *RegType = DRS.getRegType(RegNo);
+    IntegerType *RegType = DRS.getRegIntType(RegNo);
     if (Res->getType()->isPointerTy())
       Res = Builder->CreatePtrToInt(Res, RegType);
     if (!Res->getType()->isIntegerTy())
       Res = Builder->CreateBitCast(
           Res,
           IntegerType::get(Ctx, Res->getType()->getPrimitiveSizeInBits()));
-    if (Res->getType()->getPrimitiveSizeInBits() <
-        RegType->getPrimitiveSizeInBits())
-      Res = DRS.insertBitsInValue(getReg(RegNo), Res);
+    if (Res->getType()->getPrimitiveSizeInBits() < RegType->getBitWidth())
+      Res = DRS.insertBitsInValue(DRS.getRegAsInt(RegNo), Res);
     assert(Res->getType() == RegType);
     setReg(RegNo, Res);
     CurrentTInst->addRegOpDef(MIOperandNo, Res);
@@ -577,7 +591,7 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
   case DCINS::GET_RC: {
     unsigned MIOperandNo = Next();
     Type *ResType = ResEVT.getTypeForEVT(Ctx);
-    Value *Reg = getReg(getRegOp(MIOperandNo));
+    Value *Reg = DRS.getRegAsInt(getRegOp(MIOperandNo));
     if (ResType->getPrimitiveSizeInBits() <
         Reg->getType()->getPrimitiveSizeInBits())
       Reg = Builder->CreateTrunc(
@@ -625,20 +639,6 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
     translateImplicit(Next());
     break;
   }
-  case ISD::INTRINSIC_VOID: {
-    Value *IndexV = getNextOperand();
-    // FIXME: the intrinsics sdnodes have variable numbers of arguments.
-    // FIXME: handle overloaded intrinsics, but how?
-    if (ConstantInt *IndexCI = dyn_cast<ConstantInt>(IndexV)) {
-      uint64_t IntID = IndexCI->getZExtValue();
-      Value *IntDecl =
-          Intrinsic::getDeclaration(TheModule, Intrinsic::ID(IntID));
-      registerResult(Builder->CreateCall(IntDecl));
-    } else {
-      llvm_unreachable("Unable to translate non-constant intrinsic ID");
-    }
-    break;
-  }
   case ISD::BSWAP: {
     Type *ResType = ResEVT.getTypeForEVT(Ctx);
     Value *Op = getNextOperand();
@@ -648,8 +648,16 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
     break;
   }
   default:
-    llvm_unreachable(
-        ("Unknown opcode found in semantics: " + utostr(Opcode)).c_str());
+    if (!TranslateUnknownToUndef)
+      llvm_unreachable(
+          ("Unknown opcode found in semantics: " + utostr(Opcode)).c_str());
+
+    errs() << "Couldn't translate opcode for instruction: \n  ";
+    errs() << "  " << DRS.MII.getName(CurrentInst->Inst.getOpcode()) << ": "
+           << CurrentInst->Inst << "\n";
+    errs() << "Opcode: " << Opcode << "\n";
+    Builder->CreateCall(Intrinsic::getDeclaration(TheModule, Intrinsic::trap));
+    Builder->CreateUnreachable();
   }
 }
 

@@ -15,6 +15,7 @@
 #define LLVM_CODEGEN_MACHINEBASICBLOCK_H
 
 #include "llvm/ADT/GraphTraits.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/CodeGen/MachineInstrBundleIterator.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/Support/BranchProbability.h"
@@ -192,6 +193,13 @@ public:
   reverse_instr_iterator       instr_rend  ()       { return Insts.rend();   }
   const_reverse_instr_iterator instr_rend  () const { return Insts.rend();   }
 
+  typedef iterator_range<instr_iterator> instr_range;
+  typedef iterator_range<const_instr_iterator> const_instr_range;
+  instr_range instrs() { return instr_range(instr_begin(), instr_end()); }
+  const_instr_range instrs() const {
+    return const_instr_range(instr_begin(), instr_end());
+  }
+
   iterator                begin()       { return instr_begin();  }
   const_iterator          begin() const { return instr_begin();  }
   iterator                end  ()       { return instr_end();    }
@@ -333,10 +341,6 @@ public:
   /// Indicates the block is a landing pad.  That is this basic block is entered
   /// via an exception handler.
   void setIsEHPad(bool V = true) { IsEHPad = V; }
-
-  /// If this block has a successor that is a landing pad, return it. Otherwise
-  /// return NULL.
-  const MachineBasicBlock *getLandingPadSuccessor() const;
 
   bool hasEHPadSuccessor() const;
 
@@ -498,7 +502,13 @@ public:
   ///
   /// This function updates LiveVariables, MachineDominatorTree, and
   /// MachineLoopInfo, as applicable.
-  MachineBasicBlock *SplitCriticalEdge(MachineBasicBlock *Succ, Pass *P);
+  MachineBasicBlock *SplitCriticalEdge(MachineBasicBlock *Succ, Pass &P);
+
+  /// Check if the edge between this block and the given successor \p
+  /// Succ, can be split. If this returns true a subsequent call to
+  /// SplitCriticalEdge is guaranteed to return a valid basic block if
+  /// no changes occured in the meantime.
+  bool canSplitCriticalEdge(const MachineBasicBlock *Succ) const;
 
   void pop_front() { Insts.pop_front(); }
   void pop_back() { Insts.pop_back(); }
@@ -664,9 +674,9 @@ public:
 
   // Debugging methods.
   void dump() const;
-  void print(raw_ostream &OS, SlotIndexes* = nullptr) const;
+  void print(raw_ostream &OS, const SlotIndexes* = nullptr) const;
   void print(raw_ostream &OS, ModuleSlotTracker &MST,
-             SlotIndexes * = nullptr) const;
+             const SlotIndexes* = nullptr) const;
 
   // Printing method used by LoopInfo.
   void printAsOperand(raw_ostream &OS, bool PrintType = true) const;

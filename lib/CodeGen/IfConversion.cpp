@@ -7,7 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file implements the machine instruction level if-conversion pass.
+// This file implements the machine instruction level if-conversion pass, which
+// tries to convert conditional branches into predicated instructions.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,6 +34,7 @@
 #include "llvm/Target/TargetRegisterInfo.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include <algorithm>
+#include <utility>
 
 using namespace llvm;
 
@@ -176,7 +178,7 @@ namespace {
   public:
     static char ID;
     IfConverter(std::function<bool(const Function &)> Ftor = nullptr)
-        : MachineFunctionPass(ID), FnNum(-1), PredicateFtor(Ftor) {
+        : MachineFunctionPass(ID), FnNum(-1), PredicateFtor(std::move(Ftor)) {
       initializeIfConverterPass(*PassRegistry::getPassRegistry());
     }
 
@@ -187,6 +189,11 @@ namespace {
     }
 
     bool runOnMachineFunction(MachineFunction &MF) override;
+
+    MachineFunctionProperties getRequiredProperties() const override {
+      return MachineFunctionProperties().set(
+          MachineFunctionProperties::Property::AllVRegsAllocated);
+    }
 
   private:
     bool ReverseBranchCondition(BBInfo &BBI);
@@ -276,7 +283,8 @@ INITIALIZE_PASS_DEPENDENCY(MachineBranchProbabilityInfo)
 INITIALIZE_PASS_END(IfConverter, "if-converter", "If Converter", false, false)
 
 bool IfConverter::runOnMachineFunction(MachineFunction &MF) {
-  if (PredicateFtor && !PredicateFtor(*MF.getFunction()))
+  if (skipFunction(*MF.getFunction()) ||
+      (PredicateFtor && !PredicateFtor(*MF.getFunction())))
     return false;
 
   const TargetSubtargetInfo &ST = MF.getSubtarget();
@@ -580,7 +588,7 @@ bool IfConverter::ValidDiamond(BBInfo &TrueBBI, BBInfo &FalseBBI,
       if (FIB == FIE)
         break;
     }
-    if (!TIB->isIdenticalTo(FIB))
+    if (!TIB->isIdenticalTo(*FIB))
       break;
     ++Dups1;
     ++TIB;
@@ -624,7 +632,7 @@ bool IfConverter::ValidDiamond(BBInfo &TrueBBI, BBInfo &FalseBBI,
       if (FIE == FIB)
         break;
     }
-    if (!TIE->isIdenticalTo(FIE))
+    if (!TIE->isIdenticalTo(*FIE))
       break;
     ++Dups2;
     --TIE;
@@ -668,16 +676,45 @@ void IfConverter::ScanInstructions(BBInfo &BBI) {
   BBI.ExtraCost = 0;
   BBI.ExtraCost2 = 0;
   BBI.ClobbersPred = false;
-  for (MachineBasicBlock::iterator I = BBI.BB->begin(), E = BBI.BB->end();
-       I != E; ++I) {
-    if (I->isDebugValue())
+  for (auto &MI : *BBI.BB) {
+    if (MI.isDebugValue())
       continue;
 
-    if (I->isNotDuplicable())
+    // It's unsafe to duplicate convergent instructions in this context, so set
+    // BBI.CannotBeCopied to true if MI is convergent.  To see why, consider the
+    // following CFG, which is subject to our "simple" transformation.
+    //
+    //    BB0     // if (c1) goto BB1; else goto BB2;
+    //   /   \
+    //  BB1   |
+    //   |   BB2  // if (c2) goto TBB; else goto FBB;
+    //   |   / |
+    //   |  /  |
+    //   TBB   |
+    //    |    |
+    //    |   FBB
+    //    |
+    //    exit
+    //
+    // Suppose we want to move TBB's contents up into BB1 and BB2 (in BB1 they'd
+    // be unconditional, and in BB2, they'd be predicated upon c2), and suppose
+    // TBB contains a convergent instruction.  This is safe iff doing so does
+    // not add a control-flow dependency to the convergent instruction -- i.e.,
+    // it's safe iff the set of control flows that leads us to the convergent
+    // instruction does not get smaller after the transformation.
+    //
+    // Originally we executed TBB if c1 || c2.  After the transformation, there
+    // are two copies of TBB's instructions.  We get to the first if c1, and we
+    // get to the second if !c1 && c2.
+    //
+    // There are clearly fewer ways to satisfy the condition "c1" than
+    // "c1 || c2".  Since we've shrunk the set of control flows which lead to
+    // our convergent instruction, the transformation is unsafe.
+    if (MI.isNotDuplicable() || MI.isConvergent())
       BBI.CannotBeCopied = true;
 
-    bool isPredicated = TII->isPredicated(I);
-    bool isCondBr = BBI.IsBrAnalyzable && I->isConditionalBranch();
+    bool isPredicated = TII->isPredicated(MI);
+    bool isCondBr = BBI.IsBrAnalyzable && MI.isConditionalBranch();
 
     // A conditional branch is not predicable, but it may be eliminated.
     if (isCondBr)
@@ -685,8 +722,8 @@ void IfConverter::ScanInstructions(BBInfo &BBI) {
 
     if (!isPredicated) {
       BBI.NonPredSize++;
-      unsigned ExtraPredCost = TII->getPredicationCost(&*I);
-      unsigned NumCycles = SchedModel.computeInstrLatency(&*I, false);
+      unsigned ExtraPredCost = TII->getPredicationCost(MI);
+      unsigned NumCycles = SchedModel.computeInstrLatency(&MI, false);
       if (NumCycles > 1)
         BBI.ExtraCost += NumCycles-1;
       BBI.ExtraCost2 += ExtraPredCost;
@@ -710,10 +747,10 @@ void IfConverter::ScanInstructions(BBInfo &BBI) {
     // FIXME: Make use of PredDefs? e.g. ADDC, SUBC sets predicates but are
     // still potentially predicable.
     std::vector<MachineOperand> PredDefs;
-    if (TII->DefinesPredicate(I, PredDefs))
+    if (TII->DefinesPredicate(MI, PredDefs))
       BBI.ClobbersPred = true;
 
-    if (!TII->isPredicable(I)) {
+    if (!TII->isPredicable(MI)) {
       BBI.IsUnpredicable = true;
       return;
     }
@@ -1011,9 +1048,9 @@ void IfConverter::RemoveExtraEdges(BBInfo &BBI) {
 
 /// Behaves like LiveRegUnits::StepForward() but also adds implicit uses to all
 /// values defined in MI which are not live/used by MI.
-static void UpdatePredRedefs(MachineInstr *MI, LivePhysRegs &Redefs) {
+static void UpdatePredRedefs(MachineInstr &MI, LivePhysRegs &Redefs) {
   SmallVector<std::pair<unsigned, const MachineOperand*>, 4> Clobbers;
-  Redefs.stepForward(*MI, Clobbers);
+  Redefs.stepForward(MI, Clobbers);
 
   // Now add the implicit uses for each of the clobbered values.
   for (auto Reg : Clobbers) {
@@ -1050,7 +1087,7 @@ static void UpdatePredRedefs(MachineInstr *MI, LivePhysRegs &Redefs) {
  * Remove kill flags from operands with a registers in the @p DontKill set.
  */
 static void RemoveKills(MachineInstr &MI, const LivePhysRegs &DontKill) {
-  for (MIBundleOperands O(&MI); O.isValid(); ++O) {
+  for (MIBundleOperands O(MI); O.isValid(); ++O) {
     if (!O->isReg() || !O->isKill())
       continue;
     if (DontKill.contains(O->getReg()))
@@ -1101,13 +1138,13 @@ bool IfConverter::IfConvertSimple(BBInfo &BBI, IfcvtKind Kind) {
   // Initialize liveins to the first BB. These are potentiall redefined by
   // predicated instructions.
   Redefs.init(TRI);
-  Redefs.addLiveIns(CvtBBI->BB);
-  Redefs.addLiveIns(NextBBI->BB);
+  Redefs.addLiveIns(*CvtBBI->BB);
+  Redefs.addLiveIns(*NextBBI->BB);
 
   // Compute a set of registers which must not be killed by instructions in
   // BB1: This is everything live-in to BB2.
   DontKill.init(TRI);
-  DontKill.addLiveIns(NextBBI->BB);
+  DontKill.addLiveIns(*NextBBI->BB);
 
   if (CvtBBI->BB->pred_size() > 1) {
     BBI.NonPredSize -= TII->RemoveBranch(*BBI.BB);
@@ -1206,8 +1243,8 @@ bool IfConverter::IfConvertTriangle(BBInfo &BBI, IfcvtKind Kind) {
   // Initialize liveins to the first BB. These are potentially redefined by
   // predicated instructions.
   Redefs.init(TRI);
-  Redefs.addLiveIns(CvtBBI->BB);
-  Redefs.addLiveIns(NextBBI->BB);
+  Redefs.addLiveIns(*CvtBBI->BB);
+  Redefs.addLiveIns(*NextBBI->BB);
 
   DontKill.clear();
 
@@ -1361,7 +1398,7 @@ bool IfConverter::IfConvertDiamond(BBInfo &BBI, IfcvtKind Kind,
   // Initialize liveins to the first BB. These are potentially redefined by
   // predicated instructions.
   Redefs.init(TRI);
-  Redefs.addLiveIns(BBI1->BB);
+  Redefs.addLiveIns(*BBI1->BB);
 
   // Remove the duplicated instructions at the beginnings of both paths.
   // Skip dbg_value instructions
@@ -1491,8 +1528,8 @@ bool IfConverter::IfConvertDiamond(BBInfo &BBI, IfcvtKind Kind,
   if (!BBI2->BB->empty() && (DI2 == BBI2->BB->end())) {
     MachineBasicBlock::iterator BBI1T = BBI1->BB->getFirstTerminator();
     MachineBasicBlock::iterator BBI2T = BBI2->BB->getFirstTerminator();
-    if ((BBI1T != BBI1->BB->end()) && TII->isPredicated(BBI1T) &&
-       ((BBI2T != BBI2->BB->end()) && !TII->isPredicated(BBI2T)))
+    if (BBI1T != BBI1->BB->end() && TII->isPredicated(*BBI1T) &&
+        BBI2T != BBI2->BB->end() && !TII->isPredicated(*BBI2T))
       --DI2;
   }
 
@@ -1515,7 +1552,7 @@ bool IfConverter::IfConvertDiamond(BBInfo &BBI, IfcvtKind Kind,
     // (e.g. a predicated return). If that is the case, we cannot merge
     // it with the tail block.
     MachineBasicBlock::const_iterator TI = BBI.BB->getFirstTerminator();
-    if (TI != BBI.BB->end() && TII->isPredicated(TI))
+    if (TI != BBI.BB->end() && TII->isPredicated(*TI))
       CanMergeTail = false;
     // There may still be a fall-through edge from BBI1 or BBI2 to TailBB;
     // check if there are any other predecessors besides those.
@@ -1581,7 +1618,7 @@ void IfConverter::PredicateBlock(BBInfo &BBI,
   bool AnyUnpred = false;
   bool MaySpec = LaterRedefs != nullptr;
   for (MachineBasicBlock::iterator I = BBI.BB->begin(); I != E; ++I) {
-    if (I->isDebugValue() || TII->isPredicated(I))
+    if (I->isDebugValue() || TII->isPredicated(*I))
       continue;
     // It may be possible not to predicate an instruction if it's the 'true'
     // side of a diamond and the 'false' side may re-define the instruction's
@@ -1593,7 +1630,7 @@ void IfConverter::PredicateBlock(BBInfo &BBI,
     // If any instruction is predicated, then every instruction after it must
     // be predicated.
     MaySpec = false;
-    if (!TII->PredicateInstruction(I, Cond)) {
+    if (!TII->PredicateInstruction(*I, Cond)) {
 #ifndef NDEBUG
       dbgs() << "Unable to predicate " << *I << "!\n";
 #endif
@@ -1602,7 +1639,7 @@ void IfConverter::PredicateBlock(BBInfo &BBI,
 
     // If the predicated instruction now redefines a register as the result of
     // if-conversion, add an implicit kill.
-    UpdatePredRedefs(I, Redefs);
+    UpdatePredRedefs(*I, Redefs);
   }
 
   BBI.Predicate.append(Cond.begin(), Cond.end());
@@ -1622,25 +1659,24 @@ void IfConverter::CopyAndPredicateBlock(BBInfo &ToBBI, BBInfo &FromBBI,
                                         bool IgnoreBr) {
   MachineFunction &MF = *ToBBI.BB->getParent();
 
-  for (MachineBasicBlock::iterator I = FromBBI.BB->begin(),
-         E = FromBBI.BB->end(); I != E; ++I) {
+  for (auto &I : *FromBBI.BB) {
     // Do not copy the end of the block branches.
-    if (IgnoreBr && I->isBranch())
+    if (IgnoreBr && I.isBranch())
       break;
 
-    MachineInstr *MI = MF.CloneMachineInstr(I);
+    MachineInstr *MI = MF.CloneMachineInstr(&I);
     ToBBI.BB->insert(ToBBI.BB->end(), MI);
     ToBBI.NonPredSize++;
-    unsigned ExtraPredCost = TII->getPredicationCost(&*I);
-    unsigned NumCycles = SchedModel.computeInstrLatency(&*I, false);
+    unsigned ExtraPredCost = TII->getPredicationCost(I);
+    unsigned NumCycles = SchedModel.computeInstrLatency(&I, false);
     if (NumCycles > 1)
       ToBBI.ExtraCost += NumCycles-1;
     ToBBI.ExtraCost2 += ExtraPredCost;
 
     if (!TII->isPredicated(I) && !MI->isDebugValue()) {
-      if (!TII->PredicateInstruction(MI, Cond)) {
+      if (!TII->PredicateInstruction(*MI, Cond)) {
 #ifndef NDEBUG
-        dbgs() << "Unable to predicate " << *I << "!\n";
+        dbgs() << "Unable to predicate " << I << "!\n";
 #endif
         llvm_unreachable(nullptr);
       }
@@ -1648,7 +1684,7 @@ void IfConverter::CopyAndPredicateBlock(BBInfo &ToBBI, BBInfo &FromBBI,
 
     // If the predicated instruction now redefines a register as the result of
     // if-conversion, add an implicit kill.
-    UpdatePredRedefs(MI, Redefs);
+    UpdatePredRedefs(*MI, Redefs);
 
     // Some kill flags may not be correct anymore.
     if (!DontKill.empty())
@@ -1695,7 +1731,7 @@ void IfConverter::MergeBlocks(BBInfo &ToBBI, BBInfo &FromBBI, bool AddEdges) {
   ToBBI.BB->splice(ToTI, FromBBI.BB, FromBBI.BB->begin(), FromTI);
 
   // If FromBB has non-predicated terminator we should copy it at the end.
-  if ((FromTI != FromBBI.BB->end()) && !TII->isPredicated(FromTI))
+  if (FromTI != FromBBI.BB->end() && !TII->isPredicated(*FromTI))
     ToTI = ToBBI.BB->end();
   ToBBI.BB->splice(ToTI, FromBBI.BB, FromTI, FromBBI.BB->end());
 

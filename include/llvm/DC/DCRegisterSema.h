@@ -27,6 +27,7 @@
 #ifndef LLVM_DC_DCREGISTERSEMA_H
 #define LLVM_DC_DCREGISTERSEMA_H
 
+#include "llvm/CodeGen/MachineValueType.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/Support/Compiler.h"
@@ -58,6 +59,7 @@ public:
 
   DCRegisterSema(LLVMContext &Ctx, const MCRegisterInfo &MRI,
                  const MCInstrInfo &MII, const DataLayout &DL,
+                 const MVT::SimpleValueType *RegClassVTs,
                  InitSpecialRegSizesFnTy InitSpecialRegSizesFn = 0);
   virtual ~DCRegisterSema();
 
@@ -81,6 +83,11 @@ protected:
   // The size of each register, in bits.
   RegSizeTy RegSizes;
 
+  // The type of each register (the first type of the last register class
+  // containing the register).
+  // FIXME: Is there a better heuristic for register class selection?
+  std::vector<Type *> RegTypes;
+
   // The largest super register of each register, 0 if undefined, itself if the
   // register has no super-register.
   std::vector<unsigned> RegLargestSupers;
@@ -93,7 +100,7 @@ protected:
 
   // Valid only inside a Module.
   Module *TheModule;
-  typedef IRBuilder<true, NoFolder> DCIRBuilder;
+  typedef IRBuilder<NoFolder> DCIRBuilder;
   // FIXME: This doesn't need to be a pointer.
   std::unique_ptr<DCIRBuilder> Builder;
 
@@ -159,6 +166,11 @@ public:
   void setReg(unsigned RegNo, Value *Val);
 
   Type *getRegType(unsigned RegNo);
+
+  IntegerType *getRegIntType(unsigned RegNo);
+  Value *getRegAsInt(unsigned RegNo) {
+    return Builder->CreateBitCast(getReg(RegNo), getRegIntType(RegNo));
+  }
 
   // Fill 2 functions, main_{init,fini}_regset, to initialize a regset from
   // a stack pointer and ac/av, and to extract the return value.

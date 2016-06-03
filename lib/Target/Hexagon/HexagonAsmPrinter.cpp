@@ -21,8 +21,6 @@
 #include "MCTargetDesc/HexagonInstPrinter.h"
 #include "MCTargetDesc/HexagonMCInstrInfo.h"
 #include "MCTargetDesc/HexagonMCShuffler.h"
-#include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/CodeGen/AsmPrinter.h"
@@ -44,7 +42,6 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ELF.h"
 #include "llvm/Support/Format.h"
@@ -591,7 +588,7 @@ void HexagonAsmPrinter::EmitInstruction(const MachineInstr *MI) {
 
   if (MI->isBundle()) {
     const MachineBasicBlock* MBB = MI->getParent();
-    auto MII = MI->getInstrIterator();
+    MachineBasicBlock::const_instr_iterator MII = MI->getIterator();
     unsigned IgnoreCount = 0;
 
     for (++MII; MII != MBB->instr_end() && MII->isInsideBundle(); ++MII)

@@ -107,13 +107,15 @@ TargetInstrInfo::ReplaceTailWithBranchTo(MachineBasicBlock::iterator Tail,
   while (!MBB->succ_empty())
     MBB->removeSuccessor(MBB->succ_begin());
 
+  // Save off the debug loc before erasing the instruction.
+  DebugLoc DL = Tail->getDebugLoc();
+
   // Remove all the dead instructions from the end of MBB.
   MBB->erase(Tail, MBB->end());
 
   // If MBB isn't immediately before MBB, insert a branch to it.
   if (++MachineFunction::iterator(MBB) != MachineFunction::iterator(NewDest))
-    InsertBranch(*MBB, NewDest, nullptr, SmallVector<MachineOperand, 0>(),
-                 Tail->getDebugLoc());
+    InsertBranch(*MBB, NewDest, nullptr, SmallVector<MachineOperand, 0>(), DL);
   MBB->addSuccessor(NewDest);
 }
 
@@ -256,32 +258,31 @@ bool TargetInstrInfo::findCommutedOpIndices(MachineInstr *MI,
   return true;
 }
 
-bool
-TargetInstrInfo::isUnpredicatedTerminator(const MachineInstr *MI) const {
-  if (!MI->isTerminator()) return false;
+bool TargetInstrInfo::isUnpredicatedTerminator(const MachineInstr &MI) const {
+  if (!MI.isTerminator()) return false;
 
   // Conditional branch is a special case.
-  if (MI->isBranch() && !MI->isBarrier())
+  if (MI.isBranch() && !MI.isBarrier())
     return true;
-  if (!MI->isPredicable())
+  if (!MI.isPredicable())
     return true;
   return !isPredicated(MI);
 }
 
 bool TargetInstrInfo::PredicateInstruction(
-    MachineInstr *MI, ArrayRef<MachineOperand> Pred) const {
+    MachineInstr &MI, ArrayRef<MachineOperand> Pred) const {
   bool MadeChange = false;
 
-  assert(!MI->isBundle() &&
+  assert(!MI.isBundle() &&
          "TargetInstrInfo::PredicateInstruction() can't handle bundles");
 
-  const MCInstrDesc &MCID = MI->getDesc();
-  if (!MI->isPredicable())
+  const MCInstrDesc &MCID = MI.getDesc();
+  if (!MI.isPredicable())
     return false;
 
-  for (unsigned j = 0, i = 0, e = MI->getNumOperands(); i != e; ++i) {
+  for (unsigned j = 0, i = 0, e = MI.getNumOperands(); i != e; ++i) {
     if (MCID.OpInfo[i].isPredicate()) {
-      MachineOperand &MO = MI->getOperand(i);
+      MachineOperand &MO = MI.getOperand(i);
       if (MO.isReg()) {
         MO.setReg(Pred[j].getReg());
         MadeChange = true;
@@ -384,7 +385,7 @@ bool
 TargetInstrInfo::produceSameValue(const MachineInstr *MI0,
                                   const MachineInstr *MI1,
                                   const MachineRegisterInfo *MRI) const {
-  return MI0->isIdenticalTo(MI1, MachineInstr::IgnoreVRegDefs);
+  return MI0->isIdenticalTo(*MI1, MachineInstr::IgnoreVRegDefs);
 }
 
 MachineInstr *TargetInstrInfo::duplicate(MachineInstr *Orig,
@@ -496,7 +497,8 @@ static MachineInstr *foldPatchpoint(MachineFunction &MF, MachineInstr *MI,
 /// stream.
 MachineInstr *TargetInstrInfo::foldMemoryOperand(MachineBasicBlock::iterator MI,
                                                  ArrayRef<unsigned> Ops,
-                                                 int FI) const {
+                                                 int FI,
+                                                 LiveIntervals *LIS) const {
   unsigned Flags = 0;
   for (unsigned i = 0, e = Ops.size(); i != e; ++i)
     if (MI->getOperand(Ops[i]).isDef())
@@ -518,7 +520,7 @@ MachineInstr *TargetInstrInfo::foldMemoryOperand(MachineBasicBlock::iterator MI,
       MBB->insert(MI, NewMI);
   } else {
     // Ask the target to do the actual folding.
-    NewMI = foldMemoryOperandImpl(MF, MI, Ops, MI, FI);
+    NewMI = foldMemoryOperandImpl(MF, MI, Ops, MI, FI, LIS);
   }
 
   if (NewMI) {
@@ -654,7 +656,11 @@ bool TargetInstrInfo::getMachineCombinerPatterns(
 
   return false;
 }
-
+/// Return true when a code sequence can improve loop throughput.
+bool
+TargetInstrInfo::isThroughputPattern(MachineCombinerPattern Pattern) const {
+  return false;
+}
 /// Attempt the reassociation transformation to reduce critical path length.
 /// See the above comments before getMachineCombinerPatterns().
 void TargetInstrInfo::reassociateOps(
@@ -773,7 +779,8 @@ void TargetInstrInfo::genAlternativeCodeSequence(
 /// stack slot.
 MachineInstr *TargetInstrInfo::foldMemoryOperand(MachineBasicBlock::iterator MI,
                                                  ArrayRef<unsigned> Ops,
-                                                 MachineInstr *LoadMI) const {
+                                                 MachineInstr *LoadMI,
+                                                 LiveIntervals *LIS) const {
   assert(LoadMI->canFoldAsLoad() && "LoadMI isn't foldable!");
 #ifndef NDEBUG
   for (unsigned i = 0, e = Ops.size(); i != e; ++i)
@@ -795,7 +802,7 @@ MachineInstr *TargetInstrInfo::foldMemoryOperand(MachineBasicBlock::iterator MI,
       NewMI = MBB.insert(MI, NewMI);
   } else {
     // Ask the target to do the actual folding.
-    NewMI = foldMemoryOperandImpl(MF, MI, Ops, MI, LoadMI);
+    NewMI = foldMemoryOperandImpl(MF, MI, Ops, MI, LoadMI, LIS);
   }
 
   if (!NewMI) return nullptr;
@@ -1035,7 +1042,7 @@ unsigned TargetInstrInfo::defaultDefLatency(const MCSchedModel &SchedModel,
   return 1;
 }
 
-unsigned TargetInstrInfo::getPredicationCost(const MachineInstr *) const {
+unsigned TargetInstrInfo::getPredicationCost(const MachineInstr &) const {
   return 0;
 }
 

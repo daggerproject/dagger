@@ -44,15 +44,11 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include <algorithm>
 
 namespace llvm {
-
-// FIXME: Replace this brittle forward declaration with the include of the new
-// PassManager.h when doing so doesn't break the PassManagerBuilder.
-template <typename IRUnitT> class AnalysisManager;
-class PreservedAnalyses;
 
 class DominatorTree;
 class LoopInfo;
@@ -461,21 +457,13 @@ public:
   /// location by looking at the preheader and header blocks. If it
   /// cannot find a terminating instruction with location information,
   /// it returns an unknown location.
-  DebugLoc getStartLoc() const {
-    BasicBlock *HeadBB;
+  DebugLoc getStartLoc() const;
 
-    // Try the pre-header first.
-    if ((HeadBB = getLoopPreheader()) != nullptr)
-      if (DebugLoc DL = HeadBB->getTerminator()->getDebugLoc())
-        return DL;
-
-    // If we have no pre-header or there are no instructions with debug
-    // info in it, try the header.
-    HeadBB = getHeader();
-    if (HeadBB)
-      return HeadBB->getTerminator()->getDebugLoc();
-
-    return DebugLoc();
+  StringRef getName() const {
+    if (BasicBlock *Header = getHeader())
+      if (Header->hasName())
+        return Header->getName();
+    return "<unnamed loop>";
   }
 
 private:
@@ -784,30 +772,23 @@ template <> struct GraphTraits<Loop*> {
 };
 
 /// \brief Analysis pass that exposes the \c LoopInfo for a function.
-class LoopAnalysis {
+class LoopAnalysis : public AnalysisInfoMixin<LoopAnalysis> {
+  friend AnalysisInfoMixin<LoopAnalysis>;
   static char PassID;
 
 public:
   typedef LoopInfo Result;
 
-  /// \brief Opaque, unique identifier for this analysis pass.
-  static void *ID() { return (void *)&PassID; }
-
-  /// \brief Provide a name for the analysis for debugging and logging.
-  static StringRef name() { return "LoopAnalysis"; }
-
-  LoopInfo run(Function &F, AnalysisManager<Function> *AM);
+  LoopInfo run(Function &F, AnalysisManager<Function> &AM);
 };
 
 /// \brief Printer pass for the \c LoopAnalysis results.
-class LoopPrinterPass {
+class LoopPrinterPass : public PassInfoMixin<LoopPrinterPass> {
   raw_ostream &OS;
 
 public:
   explicit LoopPrinterPass(raw_ostream &OS) : OS(OS) {}
-  PreservedAnalyses run(Function &F, AnalysisManager<Function> *AM);
-
-  static StringRef name() { return "LoopPrinterPass"; }
+  PreservedAnalyses run(Function &F, AnalysisManager<Function> &AM);
 };
 
 /// \brief The legacy pass manager's analysis pass to compute loop information.
@@ -837,7 +818,7 @@ public:
 };
 
 /// \brief Pass for printing a loop's contents as LLVM's text IR assembly.
-class PrintLoopPass {
+class PrintLoopPass : public PassInfoMixin<PrintLoopPass> {
   raw_ostream &OS;
   std::string Banner;
 
@@ -846,7 +827,6 @@ public:
   PrintLoopPass(raw_ostream &OS, const std::string &Banner = "");
 
   PreservedAnalyses run(Loop &L);
-  static StringRef name() { return "PrintLoopPass"; }
 };
 
 } // End llvm namespace

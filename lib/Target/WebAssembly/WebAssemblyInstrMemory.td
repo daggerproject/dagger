@@ -28,6 +28,18 @@ def regPlusImm : PatFrag<(ops node:$addr, node:$off),
                          (add node:$addr, node:$off),
                          [{ return N->getFlags()->hasNoUnsignedWrap(); }]>;
 
+// Treat an 'or' node as an 'add' if the or'ed bits are known to be zero.
+def or_is_add : PatFrag<(ops node:$lhs, node:$rhs), (or node:$lhs, node:$rhs),[{
+  if (ConstantSDNode *CN = dyn_cast<ConstantSDNode>(N->getOperand(1)))
+    return CurDAG->MaskedValueIsZero(N->getOperand(0), CN->getAPIntValue());
+
+  APInt KnownZero0, KnownOne0;
+  CurDAG->computeKnownBits(N->getOperand(0), KnownZero0, KnownOne0, 0);
+  APInt KnownZero1, KnownOne1;
+  CurDAG->computeKnownBits(N->getOperand(1), KnownZero1, KnownOne1, 0);
+  return (~KnownZero0 & ~KnownZero1) == 0;
+}]>;
+
 // GlobalAddresses are conceptually unsigned values, so we can also fold them
 // into immediate values as long as their offsets are non-negative.
 def regPlusGA : PatFrag<(ops node:$addr, node:$off),
@@ -75,6 +87,14 @@ def : Pat<(i64 (load (regPlusImm I32:$addr, imm:$off))),
 def : Pat<(f32 (load (regPlusImm I32:$addr, imm:$off))),
           (LOAD_F32 imm:$off, $addr, 0)>;
 def : Pat<(f64 (load (regPlusImm I32:$addr, imm:$off))),
+          (LOAD_F64 imm:$off, $addr, 0)>;
+def : Pat<(i32 (load (or_is_add I32:$addr, imm:$off))),
+          (LOAD_I32 imm:$off, $addr, 0)>;
+def : Pat<(i64 (load (or_is_add I32:$addr, imm:$off))),
+          (LOAD_I64 imm:$off, $addr, 0)>;
+def : Pat<(f32 (load (or_is_add I32:$addr, imm:$off))),
+          (LOAD_F32 imm:$off, $addr, 0)>;
+def : Pat<(f64 (load (or_is_add I32:$addr, imm:$off))),
           (LOAD_F64 imm:$off, $addr, 0)>;
 def : Pat<(i32 (load (regPlusGA I32:$addr,
                                 (WebAssemblywrapper tglobaladdr:$off)))),
@@ -187,6 +207,26 @@ def : Pat<(i64 (zextloadi16 (regPlusImm I32:$addr, imm:$off))),
 def : Pat<(i64 (sextloadi32 (regPlusImm I32:$addr, imm:$off))),
           (LOAD32_S_I64 imm:$off, $addr, 0)>;
 def : Pat<(i64 (zextloadi32 (regPlusImm I32:$addr, imm:$off))),
+          (LOAD32_U_I64 imm:$off, $addr, 0)>;
+def : Pat<(i32 (sextloadi8 (or_is_add I32:$addr, imm:$off))),
+          (LOAD8_S_I32 imm:$off, $addr, 0)>;
+def : Pat<(i32 (zextloadi8 (or_is_add I32:$addr, imm:$off))),
+          (LOAD8_U_I32 imm:$off, $addr, 0)>;
+def : Pat<(i32 (sextloadi16 (or_is_add I32:$addr, imm:$off))),
+          (LOAD16_S_I32 imm:$off, $addr, 0)>;
+def : Pat<(i32 (zextloadi16 (or_is_add I32:$addr, imm:$off))),
+          (LOAD16_U_I32 imm:$off, $addr, 0)>;
+def : Pat<(i64 (sextloadi8 (or_is_add I32:$addr, imm:$off))),
+          (LOAD8_S_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (zextloadi8 (or_is_add I32:$addr, imm:$off))),
+          (LOAD8_U_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (sextloadi16 (or_is_add I32:$addr, imm:$off))),
+          (LOAD16_S_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (zextloadi16 (or_is_add I32:$addr, imm:$off))),
+          (LOAD16_U_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (sextloadi32 (or_is_add I32:$addr, imm:$off))),
+          (LOAD32_S_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (zextloadi32 (or_is_add I32:$addr, imm:$off))),
           (LOAD32_U_I64 imm:$off, $addr, 0)>;
 def : Pat<(i32 (sextloadi8 (regPlusGA I32:$addr,
                                       (WebAssemblywrapper tglobaladdr:$off)))),
@@ -332,6 +372,16 @@ def : Pat<(i64 (extloadi16 (regPlusImm I32:$addr, imm:$off))),
           (LOAD16_U_I64 imm:$off, $addr, 0)>;
 def : Pat<(i64 (extloadi32 (regPlusImm I32:$addr, imm:$off))),
           (LOAD32_U_I64 imm:$off, $addr, 0)>;
+def : Pat<(i32 (extloadi8 (or_is_add I32:$addr, imm:$off))),
+          (LOAD8_U_I32 imm:$off, $addr, 0)>;
+def : Pat<(i32 (extloadi16 (or_is_add I32:$addr, imm:$off))),
+          (LOAD16_U_I32 imm:$off, $addr, 0)>;
+def : Pat<(i64 (extloadi8 (or_is_add I32:$addr, imm:$off))),
+          (LOAD8_U_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (extloadi16 (or_is_add I32:$addr, imm:$off))),
+          (LOAD16_U_I64 imm:$off, $addr, 0)>;
+def : Pat<(i64 (extloadi32 (or_is_add I32:$addr, imm:$off))),
+          (LOAD32_U_I64 imm:$off, $addr, 0)>;
 def : Pat<(i32 (extloadi8 (regPlusGA I32:$addr,
                                      (WebAssemblywrapper tglobaladdr:$off)))),
           (LOAD8_U_I32 tglobaladdr:$off, $addr, 0)>;
@@ -433,6 +483,14 @@ def : Pat<(store F32:$val, (regPlusImm I32:$addr, imm:$off)),
           (STORE_F32 imm:$off, I32:$addr, 0, F32:$val)>;
 def : Pat<(store F64:$val, (regPlusImm I32:$addr, imm:$off)),
           (STORE_F64 imm:$off, I32:$addr, 0, F64:$val)>;
+def : Pat<(store I32:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE_I32 imm:$off, I32:$addr, 0, I32:$val)>;
+def : Pat<(store I64:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE_I64 imm:$off, I32:$addr, 0, I64:$val)>;
+def : Pat<(store F32:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE_F32 imm:$off, I32:$addr, 0, F32:$val)>;
+def : Pat<(store F64:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE_F64 imm:$off, I32:$addr, 0, F64:$val)>;
 def : Pat<(store I32:$val, (regPlusGA I32:$addr,
                                       (WebAssemblywrapper tglobaladdr:$off))),
           (STORE_I32 tglobaladdr:$off, I32:$addr, 0, I32:$val)>;
@@ -528,6 +586,16 @@ def : Pat<(truncstorei16 I64:$val, (regPlusImm I32:$addr, imm:$off)),
           (STORE16_I64 imm:$off, I32:$addr, 0, I64:$val)>;
 def : Pat<(truncstorei32 I64:$val, (regPlusImm I32:$addr, imm:$off)),
           (STORE32_I64 imm:$off, I32:$addr, 0, I64:$val)>;
+def : Pat<(truncstorei8 I32:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE8_I32 imm:$off, I32:$addr, 0, I32:$val)>;
+def : Pat<(truncstorei16 I32:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE16_I32 imm:$off, I32:$addr, 0, I32:$val)>;
+def : Pat<(truncstorei8 I64:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE8_I64 imm:$off, I32:$addr, 0, I64:$val)>;
+def : Pat<(truncstorei16 I64:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE16_I64 imm:$off, I32:$addr, 0, I64:$val)>;
+def : Pat<(truncstorei32 I64:$val, (or_is_add I32:$addr, imm:$off)),
+          (STORE32_I64 imm:$off, I32:$addr, 0, I64:$val)>;
 def : Pat<(truncstorei8 I32:$val,
                         (regPlusGA I32:$addr,
                                    (WebAssemblywrapper tglobaladdr:$off))),
@@ -602,15 +670,15 @@ def : Pat<(truncstorei32 I64:$val, (WebAssemblywrapper texternalsym:$off)),
 
 let Defs = [ARGUMENTS] in {
 
-// Memory size.
-def MEMORY_SIZE_I32 : I<(outs I32:$dst), (ins),
-                        [(set I32:$dst, (int_wasm_memory_size))],
-                        "memory_size\t$dst">,
-                      Requires<[HasAddr32]>;
-def MEMORY_SIZE_I64 : I<(outs I64:$dst), (ins),
-                        [(set I64:$dst, (int_wasm_memory_size))],
-                        "memory_size\t$dst">,
-                      Requires<[HasAddr64]>;
+// Current memory size.
+def CURRENT_MEMORY_I32 : I<(outs I32:$dst), (ins),
+                           [(set I32:$dst, (int_wasm_current_memory))],
+                           "current_memory\t$dst">,
+                         Requires<[HasAddr32]>;
+def CURRENT_MEMORY_I64 : I<(outs I64:$dst), (ins),
+                           [(set I64:$dst, (int_wasm_current_memory))],
+                           "current_memory\t$dst">,
+                         Requires<[HasAddr64]>;
 
 // Grow memory.
 def GROW_MEMORY_I32 : I<(outs), (ins I32:$delta),

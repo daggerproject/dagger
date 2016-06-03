@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This tablegen backend is emits an assembly printer for the current target.
+// This tablegen backend emits an assembly printer for the current target.
 // Note that this is currently fairly skeletal, but will grow over time.
 //
 //===----------------------------------------------------------------------===//
@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <utility>
 #include <vector>
 using namespace llvm;
 
@@ -606,7 +607,8 @@ class IAPrinter {
   std::string Result;
   std::string AsmString;
 public:
-  IAPrinter(std::string R, std::string AS) : Result(R), AsmString(AS) {}
+  IAPrinter(std::string R, std::string AS)
+      : Result(std::move(R)), AsmString(std::move(AS)) {}
 
   void addCond(const std::string &C) { Conds.push_back(C); }
 
