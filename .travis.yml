@@ -13,12 +13,17 @@ matrix:
       compiler: gcc
 
 install:
-  - if [ $TRAVIS_OS_NAME == osx ]; then brew update && brew upgrade cmake; fi
-  - if [ $TRAVIS_OS_NAME != osx ]; then sudo add-apt-repository --yes ppa:george-edison55/precise-backports; fi
-  - if [ $TRAVIS_OS_NAME != osx ]; then sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test; fi
-  - if [ $TRAVIS_OS_NAME != osx ]; then sudo apt-get update -qq; fi
-  - if [ $TRAVIS_OS_NAME != osx ]; then sudo apt-get install cmake-data cmake g++-4.8; fi
-  - if [ $TRAVIS_OS_NAME != osx ]; then export CC=gcc-4.8; export CXX=g++-4.8; fi
+  - |
+    if [ $TRAVIS_OS_NAME == osx ]; then
+      brew update && brew upgrade cmake
+    else
+      sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
+      sudo apt-get update -qq
+      sudo apt-get install g++-4.8
+      export CC=gcc-4.8; export CXX=g++-4.8
+      mkdir cmakebin && wget --no-check-certificate -O - "https://cmake.org/files/v3.5/cmake-3.5.2-Linux-x86_64.tar.gz" | tar xz --strip-components 1 -C cmakebin
+      export PATH="$PWD/cmakebin/bin:$PATH"
+    fi
 
 env:
   - CMAKE_BUILD_TYPE=Release
