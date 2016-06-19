@@ -130,21 +130,6 @@ static cl::opt<bool> MaximizeBandwidth(
     cl::desc("Maximize bandwidth when selecting vectorization factor which "
              "will be determined by the smallest type in loop."));
 
-/// This enables versioning on the strides of symbolically striding memory
-/// accesses in code like the following.
-///   for (i = 0; i < N; ++i)
-///     A[i * Stride1] += B[i * Stride2] ...
-///
-/// Will be roughly translated to
-///    if (Stride1 == 1 && Stride2 == 1) {
-///      for (i = 0; i < N; i+=4)
-///       A[i:i+3] += ...
-///    } else
-///      ...
-static cl::opt<bool> EnableMemAccessVersioning(
-    "enable-mem-access-versioning", cl::init(true), cl::Hidden,
-    cl::desc("Enable symbolic stride memory access versioning"));
-
 static cl::opt<bool> EnableInterleavedMemAccesses(
     "enable-interleaved-mem-accesses", cl::init(false), cl::Hidden,
     cl::desc("Enable vectorization on interleaved memory accesses in a loop"));
@@ -325,8 +310,8 @@ public:
   // can be validly truncated to. The cost model has assumed this truncation
   // will happen when vectorizing.
   void vectorize(LoopVectorizationLegality *L,
-                 MapVector<Instruction *, uint64_t> MinimumBitWidths) {
-    MinBWs = MinimumBitWidths;
+                 const MapVector<Instruction *, uint64_t> &MinimumBitWidths) {
+    MinBWs = &MinimumBitWidths;
     Legal = L;
     // Create a new empty loop. Unlink the old loop and connect the new one.
     createEmptyLoop();
@@ -597,7 +582,7 @@ protected:
   /// Map of scalar integer values to the smallest bitwidth they can be legally
   /// represented as. The vector equivalents of these values should be truncated
   /// to this type.
-  MapVector<Instruction *, uint64_t> MinBWs;
+  const MapVector<Instruction *, uint64_t> *MinBWs;
   LoopVectorizationLegality *Legal;
 
   // Record whether runtime checks are added.
@@ -1374,12 +1359,7 @@ public:
 
   unsigned getMaxSafeDepDistBytes() { return LAI->getMaxSafeDepDistBytes(); }
 
-  bool hasStride(Value *V) { return StrideSet.count(V); }
-  bool mustCheckStrides() { return !StrideSet.empty(); }
-  SmallPtrSet<Value *, 8>::iterator strides_begin() {
-    return StrideSet.begin();
-  }
-  SmallPtrSet<Value *, 8>::iterator strides_end() { return StrideSet.end(); }
+  bool hasStride(Value *V) { return LAI->hasStride(V); }
 
   /// Returns true if the target machine supports masked store operation
   /// for the given \p DataType and kind of access to \p Ptr.
@@ -1433,16 +1413,10 @@ private:
   /// and we know that we can read from them without segfault.
   bool blockCanBePredicated(BasicBlock *BB, SmallPtrSetImpl<Value *> &SafePtrs);
 
-  /// \brief Collect memory access with loop invariant strides.
-  ///
-  /// Looks for accesses like "a[i * StrideA]" where "StrideA" is loop
-  /// invariant.
-  void collectStridedAccess(Value *LoadOrStoreInst);
-
   /// Updates the vectorization state by adding \p Phi to the inductions list.
   /// This can set \p Phi as the main induction of the loop if \p Phi is a
   /// better choice for the main induction than the existing one.
-  void addInductionPhi(PHINode *Phi, InductionDescriptor ID,
+  void addInductionPhi(PHINode *Phi, const InductionDescriptor &ID,
                        SmallPtrSetImpl<Value *> &AllowedExit);
 
   /// Report an analysis message to assist the user in diagnosing loops that are
@@ -1451,6 +1425,16 @@ private:
   /// LoopAccessReport.
   void emitAnalysis(const LoopAccessReport &Message) const {
     emitAnalysisDiag(TheFunction, TheLoop, *Hints, Message);
+  }
+
+  /// \brief If an access has a symbolic strides, this maps the pointer value to
+  /// the stride symbol.
+  const ValueToValueMap *getSymbolicStrides() {
+    // FIXME: Currently, the set of symbolic strides is sometimes queried before
+    // it's collected.  This happens from canVectorizeWithIfConvert, when the
+    // pointer is checked to reference consecutive elements suitable for a
+    // masked access.
+    return LAI ? &LAI->getSymbolicStrides() : nullptr;
   }
 
   unsigned NumPredStores;
@@ -1512,9 +1496,6 @@ private:
 
   /// Used to emit an analysis of any legality issues.
   LoopVectorizeHints *Hints;
-
-  ValueToValueMap Strides;
-  SmallPtrSet<Value *, 8> StrideSet;
 
   /// While vectorizing these instructions we have to generate a
   /// call to the appropriate masked intrinsic
@@ -2225,7 +2206,7 @@ int LoopVectorizationLegality::isConsecutivePtr(Value *Ptr) {
   // We can emit wide load/stores only if the last non-zero index is the
   // induction variable.
   const SCEV *Last = nullptr;
-  if (!Strides.count(Gep))
+  if (!getSymbolicStrides() || !getSymbolicStrides()->count(Gep))
     Last = PSE.getSCEV(Gep->getOperand(InductionOperand));
   else {
     // Because of the multiplication by a stride we can have a s/zext cast.
@@ -2237,7 +2218,7 @@ int LoopVectorizationLegality::isConsecutivePtr(Value *Ptr) {
     //  %idxprom = zext i32 %mul to i64  << Safe cast.
     //  %arrayidx = getelementptr inbounds i32* %B, i64 %idxprom
     //
-    Last = replaceSymbolicStrideSCEV(PSE, Strides,
+    Last = replaceSymbolicStrideSCEV(PSE, *getSymbolicStrides(),
                                      Gep->getOperand(InductionOperand), Gep);
     if (const SCEVCastExpr *C = dyn_cast<SCEVCastExpr>(Last))
       Last =
@@ -3498,7 +3479,7 @@ void InnerLoopVectorizer::truncateToMinimalBitwidths() {
   // later and will remove any ext/trunc pairs.
   //
   SmallPtrSet<Value *, 4> Erased;
-  for (auto &KV : MinBWs) {
+  for (const auto &KV : *MinBWs) {
     VectorParts &Parts = WidenMap.get(KV.first);
     for (Value *&I : Parts) {
       if (Erased.count(I) || I->use_empty())
@@ -3593,7 +3574,7 @@ void InnerLoopVectorizer::truncateToMinimalBitwidths() {
   }
 
   // We'll have created a bunch of ZExts that are now parentless. Clean up.
-  for (auto &KV : MinBWs) {
+  for (const auto &KV : *MinBWs) {
     VectorParts &Parts = WidenMap.get(KV.first);
     for (Value *&I : Parts) {
       ZExtInst *Inst = dyn_cast<ZExtInst>(I);
@@ -4668,7 +4649,7 @@ bool LoopVectorizationLegality::canVectorize() {
 
   // Analyze interleaved memory accesses.
   if (UseInterleaved)
-    InterleaveInfo.analyzeInterleaving(Strides);
+    InterleaveInfo.analyzeInterleaving(*getSymbolicStrides());
 
   unsigned SCEVThreshold = VectorizeSCEVCheckThreshold;
   if (Hints->getForce() == LoopVectorizeHints::FK_Enabled)
@@ -4728,7 +4709,7 @@ static bool hasOutsideLoopUser(const Loop *TheLoop, Instruction *Inst,
 }
 
 void LoopVectorizationLegality::addInductionPhi(
-    PHINode *Phi, InductionDescriptor ID,
+    PHINode *Phi, const InductionDescriptor &ID,
     SmallPtrSetImpl<Value *> &AllowedExit) {
   Inductions[Phi] = ID;
   Type *PhiTy = Phi->getType();
@@ -4895,12 +4876,6 @@ bool LoopVectorizationLegality::canVectorizeInstrs() {
                        << "store instruction cannot be vectorized");
           return false;
         }
-        if (EnableMemAccessVersioning)
-          collectStridedAccess(ST);
-
-      } else if (LoadInst *LI = dyn_cast<LoadInst>(it)) {
-        if (EnableMemAccessVersioning)
-          collectStridedAccess(LI);
 
         // FP instructions can allow unsafe algebra, thus vectorizable by
         // non-IEEE-754 compliant SIMD units.
@@ -4942,25 +4917,6 @@ bool LoopVectorizationLegality::canVectorizeInstrs() {
   return true;
 }
 
-void LoopVectorizationLegality::collectStridedAccess(Value *MemAccess) {
-  Value *Ptr = nullptr;
-  if (LoadInst *LI = dyn_cast<LoadInst>(MemAccess))
-    Ptr = LI->getPointerOperand();
-  else if (StoreInst *SI = dyn_cast<StoreInst>(MemAccess))
-    Ptr = SI->getPointerOperand();
-  else
-    return;
-
-  Value *Stride = getStrideFromPointer(Ptr, PSE.getSE(), TheLoop);
-  if (!Stride)
-    return;
-
-  DEBUG(dbgs() << "LV: Found a strided access that we can version");
-  DEBUG(dbgs() << "  Ptr: " << *Ptr << " Stride: " << *Stride << "\n");
-  Strides[Ptr] = Stride;
-  StrideSet.insert(Stride);
-}
-
 void LoopVectorizationLegality::collectLoopUniforms() {
   // We now know that the loop is vectorizable!
   // Collect variables that will remain uniform after vectorization.
@@ -4999,7 +4955,7 @@ void LoopVectorizationLegality::collectLoopUniforms() {
 }
 
 bool LoopVectorizationLegality::canVectorizeMemory() {
-  LAI = &LAA->getInfo(TheLoop, Strides);
+  LAI = &LAA->getInfo(TheLoop);
   auto &OptionalReport = LAI->getReport();
   if (OptionalReport)
     emitAnalysis(VectorizationReport(*OptionalReport));

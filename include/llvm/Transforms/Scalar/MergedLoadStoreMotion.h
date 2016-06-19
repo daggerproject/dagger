@@ -1,4 +1,4 @@
-//===- MergedLoadStoreMotion.cpp - merge and hoist/sink load/stores -------===//
+//===- MergedLoadStoreMotion.h - merge and hoist/sink load/stores ---------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -33,6 +33,7 @@ class MergedLoadStoreMotionPass
 public:
   PreservedAnalyses run(Function &F, AnalysisManager<Function> &AM);
 };
+
 }
 
 #endif // LLVM_TRANSFORMS_SCALAR_MERGEDLOADSTOREMOTION_H

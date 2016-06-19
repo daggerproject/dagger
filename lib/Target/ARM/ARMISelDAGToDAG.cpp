@@ -3335,6 +3335,38 @@ void ARMDAGToDAGISel::Select(SDNode *N) {
     default:
       break;
 
+    case Intrinsic::arm_mrrc:
+    case Intrinsic::arm_mrrc2: {
+      SDLoc dl(N);
+      SDValue Chain = N->getOperand(0);
+      unsigned Opc;
+
+      if (Subtarget->isThumb())
+        Opc = (IntNo == Intrinsic::arm_mrrc ? ARM::t2MRRC : ARM::t2MRRC2);
+      else
+        Opc = (IntNo == Intrinsic::arm_mrrc ? ARM::MRRC : ARM::MRRC2);
+
+      SmallVector<SDValue, 5> Ops;
+      Ops.push_back(getI32Imm(cast<ConstantSDNode>(N->getOperand(2))->getZExtValue(), dl)); /* coproc */
+      Ops.push_back(getI32Imm(cast<ConstantSDNode>(N->getOperand(3))->getZExtValue(), dl)); /* opc */
+      Ops.push_back(getI32Imm(cast<ConstantSDNode>(N->getOperand(4))->getZExtValue(), dl)); /* CRm */
+
+      // The mrrc2 instruction in ARM doesn't allow predicates, the top 4 bits of the encoded
+      // instruction will always be '1111' but it is possible in assembly language to specify
+      // AL as a predicate to mrrc2 but it doesn't make any difference to the encoded instruction.
+      if (Opc != ARM::MRRC2) {
+        Ops.push_back(getAL(CurDAG, dl));
+        Ops.push_back(CurDAG->getRegister(0, MVT::i32));
+      }
+
+      Ops.push_back(Chain);
+
+      // Writes to two registers.
+      const EVT RetType[] = {MVT::i32, MVT::i32, MVT::Other};
+
+      ReplaceNode(N, CurDAG->getMachineNode(Opc, dl, RetType, Ops));
+      return;
+    }
     case Intrinsic::arm_ldaexd:
     case Intrinsic::arm_ldrexd: {
       SDLoc dl(N);
@@ -3356,11 +3388,8 @@ void ARMDAGToDAGISel::Select(SDNode *N) {
       ResTys.push_back(MVT::Other);
 
       // Place arguments in the right order.
-      SmallVector<SDValue, 7> Ops;
-      Ops.push_back(MemAddr);
-      Ops.push_back(getAL(CurDAG, dl));
-      Ops.push_back(CurDAG->getRegister(0, MVT::i32));
-      Ops.push_back(Chain);
+      SDValue Ops[] = {MemAddr, getAL(CurDAG, dl),
+                       CurDAG->getRegister(0, MVT::i32), Chain};
       SDNode *Ld = CurDAG->getMachineNode(NewOpc, dl, ResTys, Ops);
       // Transfer memoperands.
       MachineSDNode::mmo_iterator MemOp = MF->allocateMemRefsArray(1);
@@ -3529,8 +3558,8 @@ void ARMDAGToDAGISel::Select(SDNode *N) {
     case Intrinsic::arm_neon_vst2: {
       static const uint16_t DOpcodes[] = { ARM::VST2d8, ARM::VST2d16,
                                            ARM::VST2d32, ARM::VST1q64 };
-      static uint16_t QOpcodes[] = { ARM::VST2q8Pseudo, ARM::VST2q16Pseudo,
-                                     ARM::VST2q32Pseudo };
+      static const uint16_t QOpcodes[] = { ARM::VST2q8Pseudo, ARM::VST2q16Pseudo,
+                                           ARM::VST2q32Pseudo };
       SelectVST(N, false, 2, DOpcodes, QOpcodes, nullptr);
       return;
     }
@@ -3630,12 +3659,9 @@ void ARMDAGToDAGISel::Select(SDNode *N) {
   case ARMISD::VTBL1: {
     SDLoc dl(N);
     EVT VT = N->getValueType(0);
-    SmallVector<SDValue, 6> Ops;
-
-    Ops.push_back(N->getOperand(0));
-    Ops.push_back(N->getOperand(1));
-    Ops.push_back(getAL(CurDAG, dl));                // Predicate
-    Ops.push_back(CurDAG->getRegister(0, MVT::i32)); // Predicate Register
+    SDValue Ops[] = {N->getOperand(0), N->getOperand(1),
+                     getAL(CurDAG, dl),                 // Predicate
+                     CurDAG->getRegister(0, MVT::i32)}; // Predicate Register
     ReplaceNode(N, CurDAG->getMachineNode(ARM::VTBL1, dl, VT, Ops));
     return;
   }
@@ -3648,11 +3674,8 @@ void ARMDAGToDAGISel::Select(SDNode *N) {
     SDValue V1 = N->getOperand(1);
     SDValue RegSeq = SDValue(createDRegPairNode(MVT::v16i8, V0, V1), 0);
 
-    SmallVector<SDValue, 6> Ops;
-    Ops.push_back(RegSeq);
-    Ops.push_back(N->getOperand(2));
-    Ops.push_back(getAL(CurDAG, dl));                // Predicate
-    Ops.push_back(CurDAG->getRegister(0, MVT::i32)); // Predicate Register
+    SDValue Ops[] = {RegSeq, N->getOperand(2), getAL(CurDAG, dl), // Predicate
+                     CurDAG->getRegister(0, MVT::i32)}; // Predicate Register
     ReplaceNode(N, CurDAG->getMachineNode(ARM::VTBL2, dl, VT, Ops));
     return;
   }
