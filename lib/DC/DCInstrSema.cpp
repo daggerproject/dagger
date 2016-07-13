@@ -401,44 +401,51 @@ DCInstrSema::translateInst(const MCDecodedInst &DecodedInst,
     Builder->CreateStore(CurIVal, CurIPtr, true);
   }
 
-  Idx = OpcodeToSemaIdx[CurrentInst->Inst.getOpcode()];
-  if (!translateTargetInst()) {
-    if (Idx == ~0U) {
-      if (!TranslateUnknownToUndef)
-        return false;
-      errs() << "Couldn't translate instruction: \n  ";
-      errs() << "  " << DRS.MII.getName(CurrentInst->Inst.getOpcode()) << ": "
-             << CurrentInst->Inst << "\n";
-      Builder->CreateCall(
-          Intrinsic::getDeclaration(TheModule, Intrinsic::trap));
-      Builder->CreateUnreachable();
-      return true;
-    }
+  bool Success = tryTranslateInst();
 
-    {
-      // Increment the PC before anything.
-      Value *OldPC = getReg(DRS.MRI.getProgramCounter());
-      setReg(DRS.MRI.getProgramCounter(),
-             Builder->CreateAdd(
-                 OldPC, ConstantInt::get(OldPC->getType(), CurrentInst->Size)));
-    }
-
-    while ((Opcode = Next()) != DCINS::END_OF_INSTRUCTION)
-      translateOpcode(Opcode);
+  if (!Success && TranslateUnknownToUndef) {
+    errs() << "Couldn't translate instruction: \n  ";
+    errs() << "  " << DRS.MII.getName(CurrentInst->Inst.getOpcode()) << ": "
+           << CurrentInst->Inst << "\n";
+    Builder->CreateCall(Intrinsic::getDeclaration(TheModule, Intrinsic::trap));
+    Builder->CreateUnreachable();
+    Success = true;
   }
 
   Vals.clear();
   CurrentInst = nullptr;
   CurrentTInst = nullptr;
+  return Success;
+}
+
+bool DCInstrSema::tryTranslateInst() {
+  if (translateTargetInst())
+    return true;
+
+  Idx = OpcodeToSemaIdx[CurrentInst->Inst.getOpcode()];
+  if (Idx == ~0U)
+    return false;
+
+  {
+    // Increment the PC before anything.
+    Value *OldPC = getReg(DRS.MRI.getProgramCounter());
+    setReg(DRS.MRI.getProgramCounter(),
+           Builder->CreateAdd(
+               OldPC, ConstantInt::get(OldPC->getType(), CurrentInst->Size)));
+  }
+
+  while ((Opcode = Next()) != DCINS::END_OF_INSTRUCTION)
+    if (!translateOpcode(Opcode))
+      return false;
+
   return true;
 }
 
-void DCInstrSema::translateOpcode(unsigned Opcode) {
+bool DCInstrSema::translateOpcode(unsigned Opcode) {
   ResEVT = NextVT();
-  if (Opcode >= ISD::BUILTIN_OP_END && Opcode < DCINS::DC_OPCODE_START) {
-    translateTargetOpcode();
-    return;
-  }
+  if (Opcode >= ISD::BUILTIN_OP_END && Opcode < DCINS::DC_OPCODE_START)
+    return translateTargetOpcode(Opcode);
+
   switch(Opcode) {
   case ISD::ADD  : translateBinOp(Instruction::Add ); break;
   case ISD::FADD : translateBinOp(Instruction::FAdd); break;
@@ -475,6 +482,20 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
     registerResult(Builder->CreateCall(
         Intrinsic::getDeclaration(TheModule, Intrinsic::sqrt, V->getType()),
         {V}));
+    break;
+  }
+
+  case ISD::ROTL: {
+    Value *LHS = getNextOperand();
+    Type *Ty = LHS->getType();
+    assert(Ty->isIntegerTy());
+    Value *RHS = Builder->CreateZExt(getNextOperand(), Ty);
+    // FIXME: RHS needs to be tweaked to avoid undefined results.
+    registerResult(Builder->CreateOr(
+        Builder->CreateShl(LHS, RHS),
+        Builder->CreateLShr(
+            LHS, Builder->CreateSub(
+                     ConstantInt::get(Ty, Ty->getScalarSizeInBits()), RHS))));
     break;
   }
 
@@ -611,8 +632,11 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
   }
   case DCINS::CUSTOM_OP: {
     unsigned OperandType = Next(), MIOperandNo = Next();
-    translateOperand(OperandType, MIOperandNo);
-    CurrentTInst->addOpUse(MIOperandNo, OperandType, Vals.back());
+    Value *Op = translateCustomOperand(OperandType, MIOperandNo);
+    if (!Op)
+      return false;
+    registerResult(Op);
+    CurrentTInst->addOpUse(MIOperandNo, OperandType, Op);
     break;
   }
   case DCINS::CONSTANT_OP: {
@@ -647,21 +671,29 @@ void DCInstrSema::translateOpcode(unsigned Opcode) {
     registerResult(Builder->CreateCall(IntDecl, Op));
     break;
   }
-  default:
-    if (!TranslateUnknownToUndef)
-      llvm_unreachable(
-          ("Unknown opcode found in semantics: " + utostr(Opcode)).c_str());
 
+  case ISD::ATOMIC_FENCE: {
+    uint64_t OrdV = cast<ConstantInt>(getNextOperand())->getZExtValue();
+    uint64_t ScopeV = cast<ConstantInt>(getNextOperand())->getZExtValue();
+
+    if (OrdV <= (uint64_t)AtomicOrdering::NotAtomic ||
+        OrdV > (uint64_t)AtomicOrdering::SequentiallyConsistent)
+      llvm_unreachable("Invalid atomic ordering");
+    if (ScopeV != (uint64_t)SingleThread && ScopeV != (uint64_t)CrossThread)
+      llvm_unreachable("Invalid synchronization scope");
+    const AtomicOrdering Ord = (AtomicOrdering)OrdV;
+    const SynchronizationScope Scope = (SynchronizationScope)ScopeV;
+
+    Builder->CreateFence(Ord, Scope);
+    break;
+  }
+
+  default:
     errs() << "Couldn't translate opcode for instruction: \n  ";
     errs() << "  " << DRS.MII.getName(CurrentInst->Inst.getOpcode()) << ": "
            << CurrentInst->Inst << "\n";
     errs() << "Opcode: " << Opcode << "\n";
-    Builder->CreateCall(Intrinsic::getDeclaration(TheModule, Intrinsic::trap));
-    Builder->CreateUnreachable();
+    return false;
   }
-}
-
-void DCInstrSema::translateOperand(unsigned OperandType, unsigned MIOperandNo) {
-  // FIXME: We don't have target-independent operand types yet.
-  translateCustomOperand(OperandType, MIOperandNo);
+  return true;
 }

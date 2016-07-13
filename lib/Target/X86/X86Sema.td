@@ -133,15 +133,15 @@ defm : Sema_BinOpAI<"AND", and>;
 defm : Sema_BinOpAI<"XOR", xor>;
 defm : Sema_BinOpAI<"OR", or>;
 
-def : Sema_F<CMP8i8,   (set EFLAGS, (X86cmp AL,  i8 :$src))>;
-def : Sema_F<CMP16i16, (set EFLAGS, (X86cmp AX,  i16:$src))>;
-def : Sema_F<CMP32i32, (set EFLAGS, (X86cmp EAX, i32:$src))>;
-def : Sema_F<CMP64i32, (set EFLAGS, (X86cmp RAX, i64:$src))>;
+def : Semantics<CMP8i8,   [(set EFLAGS, (X86cmp AL,  i8 :$src))]>;
+def : Semantics<CMP16i16, [(set EFLAGS, (X86cmp AX,  i16:$src))]>;
+def : Semantics<CMP32i32, [(set EFLAGS, (X86cmp EAX, i32:$src))]>;
+def : Semantics<CMP64i32, [(set EFLAGS, (X86cmp RAX, i64:$src))]>;
 
-def : Sema_F<TEST8i8,   (set EFLAGS, (X86testpat AL,  i8 :$src))>;
-def : Sema_F<TEST16i16, (set EFLAGS, (X86testpat AX,  i16:$src))>;
-def : Sema_F<TEST32i32, (set EFLAGS, (X86testpat EAX, i32:$src))>;
-def : Sema_F<TEST64i32, (set EFLAGS, (X86testpat RAX, i64:$src))>;
+def : Semantics<TEST8i8,   [(set EFLAGS, (X86testpat AL,  i8 :$src))]>;
+def : Semantics<TEST16i16, [(set EFLAGS, (X86testpat AX,  i16:$src))]>;
+def : Semantics<TEST32i32, [(set EFLAGS, (X86testpat EAX, i32:$src))]>;
+def : Semantics<TEST64i32, [(set EFLAGS, (X86testpat RAX, i64:$src))]>;
 
 def : Semantics<PUSH64r, [(store GR64:$reg, (sub RSP, 8)),
                           (set RSP, (sub RSP, 8))]>;
@@ -152,10 +152,17 @@ def : Semantics<POP64r, [(set RSP, (add RSP, 8)),
 def : Semantics<POP64rmm, [(set RSP, (add RSP, 8)),
                            (store addr:$dst, (load (sub RSP, 8)))]>;
 
+def : Semantics<PUSHF64, [(store EFLAGS, (sub RSP, 4)),
+                          (set RSP, (sub RSP, 4))]>;
+def : Semantics<POPF64, [(set RSP, (add RSP, 4)),
+                         (set EFLAGS, (load (sub RSP, 4)))]>;
+
 def : Semantics<MOV8rr,  [(set  GR8:$dst,  GR8:$src)]>;
 def : Semantics<MOV16rr, [(set GR16:$dst, GR16:$src)]>;
 def : Semantics<MOV32rr, [(set GR32:$dst, GR32:$src)]>;
 def : Semantics<MOV64rr, [(set GR64:$dst, GR64:$src)]>;
+
+def : Semantics<MOV32o64a, [(store EAX, offset64_32:$dst)]>;
 
 class Sema_MOVX_m<Instruction inst, SDNode op, RegisterClass destRC, ValueType VT>
   : Semantics<inst, [(set destRC:$dst, (op (VT (load addr:$src))))]>;
@@ -172,13 +179,18 @@ def : Sema_MOVX_m<MOVSX64rm8,    sext, GR64, i8>;
 def : Sema_MOVX_m<MOVSX64rm16,   sext, GR64, i16>;
 def : Sema_MOVX_m<MOVSX64rm32,   sext, GR64, i32>;
 
+def : Semantics<SHL8r1,   [(set GR8:$dst,   (shl GR8 :$src1, (i8 1)))]>;
+def : Semantics<SHL16r1,  [(set GR16:$dst,  (shl GR16:$src1, (i16 1)))]>;
+def : Semantics<SHL32r1,  [(set GR32:$dst,  (shl GR32:$src1, (i32 1)))]>;
+def : Semantics<SHL64r1,  [(set GR64:$dst,  (shl GR64:$src1, (i64 1)))]>;
+
 // FIXME: We could use custom SD opcodes for this kind of thing.
 def : Semantics<CBW,  [(set AX,  (sext AL))]>;
 def : Semantics<CWDE, [(set EAX, (sext AX))]>;
-def : Semantics<CWD,  [(set DX,  (sra (shl AX, (i16 15)), (i16 15)))]>;
-def : Semantics<CDQ,  [(set EDX, (sra (shl EAX, (i32 31)), (i32 31)))]>;
+def : Semantics<CWD,  [(set DX,  (sra AX, (i16 15))), (set AX, AX)]>;
+def : Semantics<CDQ,  [(set EDX, (sra EAX, (i32 31))), (set EAX, EAX)]>;
 def : Semantics<CDQE, [(set RAX, (sext EAX))]>;
-def : Semantics<CQO,  [(set RDX, (sra (shl RAX, (i64 63)), (i64 63)))]>;
+def : Semantics<CQO,  [(set RDX, (sra RAX, (i64 63))), (set RAX, RAX)]>;
 
 def : Semantics<MOVUPSrr, [(set (v4f32 VR128:$dst), (v4f32 VR128:$src))]>;
 def : Semantics<MOVAPSrr, [(set (v4f32 VR128:$dst), (v4f32 VR128:$src))]>;
@@ -205,3 +217,19 @@ defm : Sema_MOVDQ<"U", VR256, v4i64, "V", "Y">;
 
 def : Semantics<MOV64toPQIrr,
         [(set VR128:$dst, (insertelt (v2i64 VR128:$dst), GR64:$src, (i32 0)))]>;
+
+def : Semantics<MOVDI2PDIrr,
+        [(set VR128:$dst, (insertelt (v4i32 VR128:$dst), GR32:$src, (i32 0)))]>;
+def : Semantics<MOVDI2PDIrm,
+        [(set VR128:$dst, (insertelt (v4i32 VR128:$dst), (loadi32 addr:$src), (i32 0)))]>;
+def : Semantics<MOVQI2PQIrm,
+        [(set VR128:$dst, (insertelt (v2i64 VR128:$dst), (loadi64 addr:$src), (i32 0)))]>;
+
+def : Semantics<CVTSS2SDrm, [(set FR64:$dst, (fextend (loadf32 addr:$src)))]>;
+
+def : Semantics<MOVSDrr,
+                        [(set VR128:$dst,
+                          (insertelt (v2f64 VR128:$src1), FR64:$src2, (i32 0)))]>;
+
+def : Semantics<MFENCE, [(atomic_fence /*Ordering=seq_cst*/7,
+                                       /*SynchScope=cross_thread*/1)]>;

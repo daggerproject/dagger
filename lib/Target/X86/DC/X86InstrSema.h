@@ -40,15 +40,16 @@ class X86InstrSema : public DCInstrSema {
 public:
   X86InstrSema(DCRegisterSema &DRS);
 
-  void translateTargetOpcode();
-  void translateCustomOperand(unsigned OperandType, unsigned MIOperandNo);
-  void translateImplicit(unsigned RegNo);
+  bool translateTargetOpcode(unsigned Opcode) override;
+  Value *translateCustomOperand(unsigned OperandType, unsigned MIOperandNo) override;
+  bool translateImplicit(unsigned RegNo) override;
 
-  bool translateTargetInst();
+  bool translateTargetInst() override;
 
 private:
-  void translateAddr(unsigned MIOperandNo,
-                     MVT::SimpleValueType VT = MVT::iPTRAny);
+  Value *translateAddr(unsigned MIOperandNo,
+                       MVT::SimpleValueType VT = MVT::iPTRAny);
+  Value *translateMemOffset(unsigned MIOperandNo, MVT::SimpleValueType VT);
 
   void translatePush(Value *Val);
   Value *translatePop(unsigned SizeInBytes);
@@ -58,6 +59,7 @@ private:
 
   void translateShuffle(SmallVectorImpl<int> &Mask, Value *V1,
                         Value *V2 = nullptr);
+  Value *translatePSHUFB(Value *V, Value *Mask);
 
   void translateCMPXCHG(unsigned MemOpType, unsigned CmpReg);
 };

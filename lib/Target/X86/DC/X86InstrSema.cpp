@@ -109,8 +109,7 @@ bool X86InstrSema::translateTargetInst() {
       if (XADDMemOpType != X86::OpTypes::OPERAND_TYPE_INVALID) {
         AtomicOpc = AtomicRMWInst::Add;
         Opc = Instruction::Add;
-        translateCustomOperand(XADDMemOpType, 0);
-        PointerOperand = Vals.back();
+        PointerOperand = translateCustomOperand(XADDMemOpType, 0);
         Operand2 = getReg(getRegOp(5));
       } else {
         if (AtomicOpc == AtomicRMWInst::BAD_BINOP)
@@ -198,11 +197,37 @@ bool X86InstrSema::translateTargetInst() {
     return true;
   }
 
+  case X86::XCHG16ar:
+  case X86::XCHG32ar:
+  case X86::XCHG32ar64:
+  case X86::XCHG64ar: {
+    unsigned R1 = getRegOp(0);
+    unsigned R2;
+    switch (Opcode) {
+    case X86::XCHG16ar:
+      R2 = X86::AX;
+      break;
+    case X86::XCHG32ar64:
+    case X86::XCHG32ar:
+      R2 = X86::EAX;
+      break;
+    case X86::XCHG64ar:
+      R2 = X86::RAX;
+      break;
+    }
+    Value *V1 = getReg(R1);
+    Value *V2 = getReg(R2);
+    setReg(R2, V1);
+    setReg(R1, V2);
+    return true;
+  }
+
   case X86::NOOP:
   case X86::NOOPW:
   case X86::NOOPL:
     return true;
 
+  case X86::XLAT:
   case X86::CPUID: {
     // FIXME: There's no reason to have a function, this is just a hack to get
     // it working.
@@ -238,11 +263,12 @@ bool X86InstrSema::translateTargetInst() {
   return false;
 }
 
-void X86InstrSema::translateTargetOpcode() {
-  switch(Opcode) {
+bool X86InstrSema::translateTargetOpcode(unsigned Opcode) {
+  switch (Opcode) {
   default:
-    llvm_unreachable(
-        ("Unknown X86 opcode found in semantics: " + utostr(Opcode)).c_str());
+    errs() << "Unknown X86 opcode found in semantics: " + utostr(Opcode)
+           << "\n";
+    return false;
   case X86ISD::CMOV: {
     Value *Op1 = getNextOperand(), *Op2 = getNextOperand(),
           *Op3 = getNextOperand(), *Op4 = getNextOperand();
@@ -384,6 +410,37 @@ void X86InstrSema::translateTargetOpcode() {
     translateDivRem(/* isThreeOperand= */ true, /* isSigned= */ true);
     break;
 
+  case X86ISD::FSETCC: {
+    enum SSECC { EQ, LT, LE, UNORD, NEQ, NLT, NLE, ORD, LastCC = ORD };
+    Value *LHS = getNextOperand(), *RHS = getNextOperand();
+    Value *CCV = getNextOperand();
+
+    const unsigned CCI = cast<ConstantInt>(CCV)->getZExtValue();
+    assert(CCI <= SSECC::LastCC && "Invalid SSE CC!");
+    const SSECC CC = (SSECC)CCI;
+
+    CmpInst::Predicate Pred;
+    switch (CC) {
+    case EQ: Pred = CmpInst::FCMP_OEQ; break;
+    case LT: Pred = CmpInst::FCMP_OLT; break;
+    case LE: Pred = CmpInst::FCMP_OLE; break;
+    case UNORD: Pred = CmpInst::FCMP_UNO; break;
+    case NEQ: Pred = CmpInst::FCMP_UNE; break;
+    case NLT: Pred = CmpInst::FCMP_UGE; break;
+    case NLE: Pred = CmpInst::FCMP_UGT; break;
+    case ORD: Pred = CmpInst::FCMP_ORD; break;
+    }
+
+    Type *ResTy = ResEVT.getTypeForEVT(Ctx);
+    assert(ResTy->isFloatingPointTy());
+
+    Value *Cmp = Builder->CreateFCmp(Pred, LHS, RHS);
+    Cmp = Builder->CreateSExt(
+        Cmp, Builder->getIntNTy(ResTy->getPrimitiveSizeInBits()));
+    registerResult(Builder->CreateBitCast(Cmp, ResTy));
+    break;
+  }
+
   case X86ISD::FMIN:
   case X86ISD::FMAX: {
     // FIXME: Ok this is an interesting one. The short version is: we don't
@@ -434,6 +491,46 @@ void X86InstrSema::translateTargetOpcode() {
     }
     registerResult(
         Builder->CreateShuffleVector(Src1, Src2, ConstantVector::get(Mask)));
+    break;
+  }
+  case X86ISD::PSHUFB: {
+    Value *Src = getNextOperand();
+    Value *Mask = getNextOperand();
+    const unsigned NumElts = ResEVT.getVectorNumElements();
+
+    // If the high bit (7) of the byte is set, the element is zeroed.
+    // Do that on the entire vector first.
+    Mask = Builder->CreateSelect(
+        Builder->CreateICmpUGE(
+            Mask, ConstantVector::getSplat(NumElts, Builder->getInt8(0x80))),
+        Constant::getNullValue(Mask->getType()), Mask);
+
+    // Of the remaining bits, only the least significant 4 are used.
+    Mask = Builder->CreateAnd(
+        Mask, ConstantVector::getSplat(NumElts, Builder->getInt8(0xF)));
+
+    // For AVX vectors with 32 bytes the base of the shuffle is the half of
+    // the vector we're inside. Split the whole vector to avoid lane selects.
+    if (NumElts == 16) {
+      registerResult(translatePSHUFB(Src, Mask));
+      break;
+    }
+
+    assert(NumElts == 32);
+    const uint32_t ShufMask[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+                                   11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                                   22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+    ArrayRef<uint32_t> LoShuf(&ShufMask[0], 16), HiShuf(&ShufMask[16], 16);
+    Value *UndefV = UndefValue::get(Src->getType());
+    Value *SrcLo = Builder->CreateShuffleVector(Src, UndefV, LoShuf);
+    Value *SrcHi = Builder->CreateShuffleVector(Src, UndefV, HiShuf);
+    Value *MaskLo = Builder->CreateShuffleVector(Mask, UndefV, LoShuf);
+    Value *MaskHi = Builder->CreateShuffleVector(Mask, UndefV, HiShuf);
+
+    Value *ResLo = translatePSHUFB(SrcLo, MaskLo);
+    Value *ResHi = translatePSHUFB(SrcHi, MaskHi);
+
+    registerResult(Builder->CreateShuffleVector(ResLo, ResHi, ShufMask));
     break;
   }
   case X86ISD::UNPCKL:
@@ -489,42 +586,104 @@ void X86InstrSema::translateTargetOpcode() {
     translateShuffle(Mask, Src1, Src2);
     break;
   }
+  case X86ISD::PCMPGT: {
+    Type *ResType = ResEVT.getTypeForEVT(Ctx);
+    Value *Src1 = getNextOperand();
+    Value *Src2 = getNextOperand();
+    Constant *Ones = Constant::getAllOnesValue(ResType);
+    Constant *Zero = Constant::getNullValue(ResType);
+    registerResult(
+        Builder->CreateSelect(Builder->CreateICmpSGT(Src1, Src2), Ones, Zero));
+    break;
+  }
+  case X86ISD::PCMPEQ: { // FIXME
+    Type *ResType = ResEVT.getTypeForEVT(Ctx);
+    Value *Src1 = getNextOperand();
+    Value *Src2 = getNextOperand();
+    Constant *Ones = Constant::getAllOnesValue(ResType);
+    Constant *Zero = Constant::getNullValue(ResType);
+    registerResult(
+        Builder->CreateSelect(Builder->CreateICmpEQ(Src1, Src2), Ones, Zero));
+    break;
+  }
+
+  case X86ISD::ANDNP: {
+    Value *LHS = getNextOperand();
+    Value *RHS = getNextOperand();
+    Type *VecTy = ResEVT.getTypeForEVT(Ctx);
+    (void)VecTy;
+    assert(VecTy->isVectorTy() && VecTy->isIntOrIntVectorTy() &&
+           VecTy == LHS->getType() && VecTy == RHS->getType() &&
+           "Operands to ANDNP shuffle aren't vectors!");
+    registerResult(Builder->CreateAnd(Builder->CreateNot(LHS), RHS));
+    break;
+  }
+
+  case X86ISD::VSHLI: {
+    Value *Src1 = getNextOperand();
+    auto *Src2 = cast<ConstantInt>(getNextOperand());
+    registerResult(Builder->CreateShl(Src1, Src2->getZExtValue()));
+    break;
+  }
+  case X86ISD::VSRAI: {
+    Value *Src1 = getNextOperand();
+    auto *Src2 = cast<ConstantInt>(getNextOperand());
+    registerResult(Builder->CreateAShr(Src1, Src2->getZExtValue()));
+    break;
+  }
   case X86ISD::HSUB:  translateHorizontalBinop(Instruction::Sub);  break;
   case X86ISD::HADD:  translateHorizontalBinop(Instruction::Add);  break;
   case X86ISD::FHSUB: translateHorizontalBinop(Instruction::FSub); break;
   case X86ISD::FHADD: translateHorizontalBinop(Instruction::FAdd); break;
   }
+
+  return true;
 }
 
-void X86InstrSema::translateCustomOperand(unsigned OperandType,
-                                          unsigned MIOpNo) {
-  switch(OperandType) {
-  default:
-    llvm_unreachable(("Unknown X86 operand type found in semantics: " +
-                     utostr(OperandType)).c_str());
+Value *X86InstrSema::translateCustomOperand(unsigned OperandType,
+                                            unsigned MIOpNo) {
+  Value *Res = nullptr;
 
-  case X86::OpTypes::i8mem : translateAddr(MIOpNo, MVT::i8); break;
-  case X86::OpTypes::i16mem: translateAddr(MIOpNo, MVT::i16); break;
-  case X86::OpTypes::i32mem: translateAddr(MIOpNo, MVT::i32); break;
-  case X86::OpTypes::i64mem: translateAddr(MIOpNo, MVT::i64); break;
-  case X86::OpTypes::f32mem: translateAddr(MIOpNo, MVT::f32); break;
-  case X86::OpTypes::f64mem: translateAddr(MIOpNo, MVT::f64); break;
-  case X86::OpTypes::f80mem: translateAddr(MIOpNo, MVT::f80); break;
+  switch (OperandType) {
+  default:
+    errs() << "Unknown X86 operand type found in semantics: "
+           << utostr(OperandType) << "\n";
+    return nullptr;
+
+  case X86::OpTypes::i8mem : Res = translateAddr(MIOpNo, MVT::i8); break;
+  case X86::OpTypes::i16mem: Res = translateAddr(MIOpNo, MVT::i16); break;
+  case X86::OpTypes::i32mem: Res = translateAddr(MIOpNo, MVT::i32); break;
+  case X86::OpTypes::i64mem: Res = translateAddr(MIOpNo, MVT::i64); break;
+  case X86::OpTypes::f32mem: Res = translateAddr(MIOpNo, MVT::f32); break;
+  case X86::OpTypes::f64mem: Res = translateAddr(MIOpNo, MVT::f64); break;
+  case X86::OpTypes::f80mem: Res = translateAddr(MIOpNo, MVT::f80); break;
 
   // Just fallback to an integer for the rest, let the user decide the type.
   case X86::OpTypes::i128mem :
   case X86::OpTypes::i256mem :
   case X86::OpTypes::f128mem :
   case X86::OpTypes::f256mem :
-  case X86::OpTypes::lea64mem: translateAddr(MIOpNo); break;
+  case X86::OpTypes::lea64mem: Res = translateAddr(MIOpNo); break;
 
   case X86::OpTypes::lea64_32mem: {
-    translateAddr(MIOpNo);
-    Value *&Ptr = Vals.back();
-    Ptr = Builder->CreateTruncOrBitCast(Ptr, Builder->getInt32Ty());
+    Res = Builder->CreateTruncOrBitCast(translateAddr(MIOpNo),
+                                        Builder->getInt32Ty());
     break;
   }
 
+  case X86::OpTypes::offset16_8 : Res = translateMemOffset(MIOpNo, MVT::i8); break;
+  case X86::OpTypes::offset32_8 : Res = translateMemOffset(MIOpNo, MVT::i8); break;
+  case X86::OpTypes::offset64_8 : Res = translateMemOffset(MIOpNo, MVT::i8); break;
+  case X86::OpTypes::offset16_16: Res = translateMemOffset(MIOpNo, MVT::i16); break;
+  case X86::OpTypes::offset32_16: Res = translateMemOffset(MIOpNo, MVT::i16); break;
+  case X86::OpTypes::offset64_16: Res = translateMemOffset(MIOpNo, MVT::i16); break;
+  case X86::OpTypes::offset16_32: Res = translateMemOffset(MIOpNo, MVT::i32); break;
+  case X86::OpTypes::offset32_32: Res = translateMemOffset(MIOpNo, MVT::i32); break;
+  case X86::OpTypes::offset64_32: Res = translateMemOffset(MIOpNo, MVT::i32); break;
+  case X86::OpTypes::offset32_64: Res = translateMemOffset(MIOpNo, MVT::i64); break;
+  case X86::OpTypes::offset64_64: Res = translateMemOffset(MIOpNo, MVT::i64); break;
+
+  case X86::OpTypes::SSECC:
   case X86::OpTypes::u8imm:
   case X86::OpTypes::i1imm:
   case X86::OpTypes::i8imm:
@@ -538,9 +697,7 @@ void X86InstrSema::translateCustomOperand(unsigned OperandType,
   case X86::OpTypes::i64imm: {
     // FIXME: Is there anything special to do with the sext/zext?
     Type *ResType = ResEVT.getTypeForEVT(Ctx);
-    Value *Cst =
-        ConstantInt::get(cast<IntegerType>(ResType), getImmOp(MIOpNo));
-    registerResult(Cst);
+    Res = ConstantInt::get(cast<IntegerType>(ResType), getImmOp(MIOpNo));
     // FIXME: factor this out in DIS.
     // lets us maintain DTIT info as well.
     break;
@@ -554,13 +711,16 @@ void X86InstrSema::translateCustomOperand(unsigned OperandType,
     // FIXME: use MCInstrAnalysis for this kind of thing?
     uint64_t Target = getImmOp(MIOpNo) +
       CurrentInst->Address + CurrentInst->Size;
-    registerResult(Builder->getInt64(Target));
+    Res = Builder->getInt64(Target);
     break;
   }
   }
+
+  assert(Res);
+  return Res;
 }
 
-void X86InstrSema::translateImplicit(unsigned RegNo) {
+bool X86InstrSema::translateImplicit(unsigned RegNo) {
   assert(RegNo == X86::EFLAGS);
   // FIXME: We need to understand instructions that define multiple values.
   Value *Def = 0;
@@ -574,10 +734,11 @@ void X86InstrSema::translateImplicit(unsigned RegNo) {
   }
   assert(Def && "Nothing was defined in an instruction with implicit EFLAGS?");
   X86DRS.updateEFLAGS(Def);
+  return true;
 }
 
-void X86InstrSema::translateAddr(unsigned MIOperandNo,
-                                 MVT::SimpleValueType VT) {
+Value *X86InstrSema::translateAddr(unsigned MIOperandNo,
+                                   MVT::SimpleValueType VT) {
   // FIXME: We should switch to TargetRegisterInfo/InstrInfo instead of MC,
   // first because of all things 64 bit mode (ESP/RSP, size of iPTR, ..).
   // We already depend on codegen in lots of places, maybe completely
@@ -606,7 +767,23 @@ void X86InstrSema::translateAddr(unsigned MIOperandNo,
     Res = Builder->CreateIntToPtr(Res, PtrTy);
   }
 
-  registerResult(Res);
+  return Res;
+}
+
+Value *X86InstrSema::translateMemOffset(unsigned MIOperandNo,
+                                        MVT::SimpleValueType VT) {
+  Value *Offset = Builder->getInt64(getImmOp(MIOperandNo));
+  unsigned SegReg = getRegOp(MIOperandNo + 1);
+
+  if (SegReg)
+    report_fatal_error("Segments are unsupported!");
+
+  if (VT != MVT::iPTRAny) {
+    Type *PtrTy = EVT(VT).getTypeForEVT(Ctx)->getPointerTo();
+    Offset = Builder->CreateIntToPtr(Offset, PtrTy);
+  }
+
+  return Offset;
 }
 
 void X86InstrSema::translatePush(Value *Val) {
@@ -700,6 +877,23 @@ void X86InstrSema::translateDivRem(bool isThreeOperand, bool isSigned) {
                      Builder->CreateBinOp(RemOp, Dividend, Divisor), ResType));
 }
 
+Value *X86InstrSema::translatePSHUFB(Value *V, Value *Mask) {
+  assert(V->getType() == Mask->getType());
+  assert(V->getType()->getVectorNumElements() == 16);
+  assert(V->getType()->getVectorElementType() == Builder->getInt8Ty());
+
+  Value *Res = UndefValue::get(V->getType());
+  for (int i = 0; i < 16; ++i) {
+    // Get the next element from the source.
+    Value *Elt = Builder->CreateExtractElement(V, Builder->getInt32(i));
+    // Get the corresponding index from the mask.
+    Value *Idx = Builder->CreateExtractElement(Mask, Builder->getInt32(i));
+    // And put the element at that index in the result.
+    Res = Builder->CreateInsertElement(Res, Elt, Idx);
+  }
+  return Res;
+}
+
 void X86InstrSema::translateShuffle(SmallVectorImpl<int> &Mask, Value *V1,
                                     Value *V2) {
   Type *VecTy = V1->getType();
@@ -734,8 +928,7 @@ void X86InstrSema::translateShuffle(SmallVectorImpl<int> &Mask, Value *V1,
 
 void X86InstrSema::translateCMPXCHG(unsigned MemOpType, unsigned CmpReg) {
   // First, translate the mem operand.
-  translateCustomOperand(MemOpType, 0);
-  Value *PointerOperand = Vals.back();
+  Value *PointerOperand = translateCustomOperand(MemOpType, 0);
 
   // Next, get the A-reg compare value.
   Value *CmpVal = getReg(CmpReg);
