@@ -17,8 +17,11 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Signals.h"
+#include "llvm/TableGen/Error.h"
 #include "llvm/TableGen/Record.h"
 #include "llvm/TableGen/TableGenBackend.h"
 #include <algorithm>
@@ -27,6 +30,27 @@
 using namespace llvm;
 
 namespace {
+
+static std::string sanitizeSelectFuncToEnumVal(Record &CP, const CodeGenDAGPatterns &CGP) {
+  const ComplexPattern &CPI = CGP.getComplexPattern(&CP);
+  StringRef F = CPI.getSelectFunc();
+
+  if (!F.startswith("select") && !F.startswith("Select"))
+    PrintFatalError(
+        CP.getLoc(),
+        Twine("ComplexPattern func doesn't start with 'select': '") + F + "'.");
+
+  F = F.drop_front(StringRef("select").size());
+
+  std::string SF = F.str();
+  auto Pos = SF.find('<');
+  if (Pos != SF.npos) {
+    SF[Pos] = '_';
+    SF.pop_back();
+  }
+
+  return SF;
+}
 
 /// The target we're generating semantics for: keeps around some useful
 /// references to the parsed CodeGen target description, and some generation
@@ -148,9 +172,12 @@ private:
   /// the defined values.
   void addSemantics(const LSNode &NS) {
     const unsigned FirstDefNo = CurDefNo;
-    for (auto &Ty : NS.Types)
+    for (auto &Ty : NS.Types) {
       if (Ty != MVT::isVoid)
         ++CurDefNo;
+      if (Ty == MVT::Untyped)
+        I.HasIntrinsic = true;
+    }
     if (FirstDefNo != CurDefNo) {
       I.LastDefNo = FirstDefNo;
       I.LastDefSemaIdx = I.Semantics.size();
@@ -256,7 +283,7 @@ private:
     const unsigned NumDefs = TPN.getNumChildren() - 1;
     const TreePatternNode &LastChild = *TPN.getChild(TPN.getNumChildren() - 1);
 
-    assert(NumDefs == LastChild.getNumTypes() &&
+    assert(NumDefs <= LastChild.getNumTypes() &&
            "Invalid 'set': last child needs to define all the others.");
 
     // Visit the last (non-register) child, that defined the values for all
@@ -313,6 +340,44 @@ private:
     LSNode NS(TPN);
 
     Record *Operator = TPN.getOperator();
+    if (Operator->isSubClassOf("ComplexPattern")) {
+
+      if (TPN.getIntrinsicInfo(Target.CGPatterns))
+        I.HasIntrinsic = true;
+      I.HasComplexPattern = false;
+
+      NS.Opcode = "DCINS::COMPLEX_PATTERN";
+      NS.addOperand(CGI.Namespace + "::ComplexPattern::" +
+                    sanitizeSelectFuncToEnumVal(*Operator, Target.CGPatterns));
+
+      for (unsigned i = 0, e = TPN.getNumChildren(); i != e; ++i) {
+        LSResults ChildRes = flattenSubtree(*TPN.getChild(i));
+        assert(!ChildRes.empty() && "Subtree didn't defined anything?");
+
+        // Now add one result for each child only.
+        // For instance:
+        //   (store (umul_lohi x, y), addr)
+        // This ignores the second result of umul_lohi, and only stores the
+        // first.
+        NS.addOperand(utostr(ChildRes.front().DefNo));
+      }
+
+      // Now produce our results, ignoring Void "defs", and adjusting for
+      // the SDNode equivalence, if necessary.
+      LSResults R;
+      for (unsigned i = 0, e = NS.Types.size(); i != e; ++i) {
+        MVT::SimpleValueType ResVT = NS.Types[i];
+        assert(ResVT < MVT::Any);
+        if (ResVT != MVT::isVoid)
+          R.emplace_back(CurDefNo + i, ResVT);
+        if (ResVT == MVT::Untyped)
+          I.HasIntrinsic = true;
+      }
+
+      addSemantics(NS);
+      return R;
+    }
+
     if (!Operator->isSubClassOf("SDNode"))
       llvm_unreachable("Unable to handle operator.");
 
@@ -331,6 +396,16 @@ private:
       assert((TPN.getNumTypes() - EquivSDNI.getNumResults()) > 0);
       NS.Types.resize(NS.Types.size() -
                       (TPN.getNumTypes() - EquivSDNI.getNumResults()));
+    }
+
+    ArrayRef<TreePredicateFn> Preds = TPN.getPredicateFns();
+    if (!Preds.empty()) {
+      Record *PredRec = Preds.back().getOrigPatFragRecord()->getRecord();
+      NS.Opcode = "DCINS::PREDICATE";
+      // FIXME: Once we can generate the TargetOpcode::Predicate enum once, we
+      // should add a Namespace field to PatFrag to be able to distinguish
+      // between targets.
+      NS.addOperand("TargetOpcode::Predicate::" + PredRec->getName());
     }
 
     for (unsigned i = 0, e = TPN.getNumChildren(); i != e; ++i) {
@@ -545,6 +620,22 @@ void SemanticsEmitter::run(raw_ostream &OS) {
   OS << "namespace {\n\n";
 
   OS << "#ifdef GET_INSTR_SEMA\n";
+
+  std::vector<Record *> CPs = Records.getAllDerivedDefinitions("ComplexPattern");
+
+  std::vector<std::string> CPKinds;
+
+  for (Record *CP : CPs)
+    CPKinds.push_back(sanitizeSelectFuncToEnumVal(*CP, CGPatterns));
+
+  std::stable_sort(CPKinds.begin(), CPKinds.end());
+  CPKinds.erase(std::unique(CPKinds.begin(), CPKinds.end()), CPKinds.end());
+
+  OS << "namespace ComplexPattern {\n";
+  OS << "enum {\n";
+  for (auto &CPK : CPKinds)
+    OS << "  " << CPK << ",\n";
+  OS << "};\n} // End ComplexPattern namespace\n\n";
 
   OS << "const unsigned InstSemantics[] = {\n";
   OS << "  DCINS::END_OF_INSTRUCTION,\n";
