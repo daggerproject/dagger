@@ -139,8 +139,9 @@ namespace llvm {
       /// at function entry, used for PIC code.
       GlobalBaseReg,
 
-      /// A wrapper node for TargetConstantPool,
-      /// TargetExternalSymbol, and TargetGlobalAddress.
+      /// A wrapper node for TargetConstantPool, TargetJumpTable,
+      /// TargetExternalSymbol, TargetGlobalAddress, TargetGlobalTLSAddress,
+      /// MCSymbol and TargetBlockAddress.
       Wrapper,
 
       /// Special wrapper used under X86-64 PIC mode for RIP
@@ -302,8 +303,8 @@ namespace llvm {
       // Vector FP round.
       VFPROUND, VFPROUND_RND, VFPROUNDS_RND,
 
-      // Vector double to signed integer (truncated).
-      CVTTPD2DQ,
+      // Vector double to signed/unsigned integer (truncated).
+      CVTTPD2DQ, CVTTPD2UDQ,
 
       // Vector signed/unsigned integer to double.
       CVTDQ2PD, CVTUDQ2PD,
@@ -1268,9 +1269,9 @@ namespace llvm {
     bool isFsqrtCheap(SDValue Operand, SelectionDAG &DAG) const override;
 
     /// Use rsqrt* to speed up sqrt calculations.
-    SDValue getRsqrtEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
-                             int &RefinementSteps,
-                             bool &UseOneConstNR) const override;
+    SDValue getSqrtEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,
+                            int &RefinementSteps, bool &UseOneConstNR,
+                            bool Reciprocal) const override;
 
     /// Use rcp* to speed up fdiv calculations.
     SDValue getRecipEstimate(SDValue Operand, SelectionDAG &DAG, int Enabled,

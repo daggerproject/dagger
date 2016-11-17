@@ -1073,7 +1073,7 @@ Expected<std::unique_ptr<MachOObjectFile>>
 MachOObjectFile::create(MemoryBufferRef Object, bool IsLittleEndian,
                         bool Is64Bits, uint32_t UniversalCputype,
                         uint32_t UniversalIndex) {
-  Error Err;
+  Error Err = Error::success();
   std::unique_ptr<MachOObjectFile> Obj(
       new MachOObjectFile(std::move(Object), IsLittleEndian,
                           Is64Bits, Err, UniversalCputype,
@@ -1499,6 +1499,74 @@ MachOObjectFile::MachOObjectFile(MemoryBufferRef Object, bool IsLittleEndian,
   assert(LoadCommands.size() == LoadCommandCount);
 
   Err = Error::success();
+}
+
+Error MachOObjectFile::checkSymbolTable() const {
+  uint32_t Flags = 0;
+  if (is64Bit()) {
+    MachO::mach_header_64 H_64 = MachOObjectFile::getHeader64();
+    Flags = H_64.flags;
+  } else {
+    MachO::mach_header H = MachOObjectFile::getHeader();
+    Flags = H.flags;
+  }
+  uint8_t NType = 0;
+  uint8_t NSect = 0;
+  uint16_t NDesc = 0;
+  uint32_t NStrx = 0;
+  uint64_t NValue = 0;
+  uint32_t SymbolIndex = 0;
+  MachO::symtab_command S = getSymtabLoadCommand();
+  for (const SymbolRef &Symbol : symbols()) {
+    DataRefImpl SymDRI = Symbol.getRawDataRefImpl();
+    if (is64Bit()) {
+      MachO::nlist_64 STE_64 = getSymbol64TableEntry(SymDRI);
+      NType = STE_64.n_type;
+      NSect = STE_64.n_sect;
+      NDesc = STE_64.n_desc;
+      NStrx = STE_64.n_strx;
+      NValue = STE_64.n_value;
+    } else {
+      MachO::nlist STE = getSymbolTableEntry(SymDRI);
+      NType = STE.n_type;
+      NType = STE.n_type;
+      NSect = STE.n_sect;
+      NDesc = STE.n_desc;
+      NStrx = STE.n_strx;
+      NValue = STE.n_value;
+    }
+    if ((NType & MachO::N_STAB) == 0 &&
+        (NType & MachO::N_TYPE) == MachO::N_SECT) {
+      if (NSect == 0 || NSect > Sections.size())
+        return malformedError("bad section index: " + Twine((int)NSect) +
+                              " for symbol at index " + Twine(SymbolIndex));
+    }
+    if ((NType & MachO::N_STAB) == 0 &&
+        (NType & MachO::N_TYPE) == MachO::N_INDR) {
+      if (NValue >= S.strsize)
+        return malformedError("bad n_value: " + Twine((int)NValue) + " past "
+                              "the end of string table, for N_INDR symbol at "
+                              "index " + Twine(SymbolIndex));
+    }
+    if ((Flags & MachO::MH_TWOLEVEL) == MachO::MH_TWOLEVEL &&
+        (((NType & MachO::N_TYPE) == MachO::N_UNDF && NValue == 0) ||
+         (NType & MachO::N_TYPE) == MachO::N_PBUD)) {
+      uint32_t LibraryOrdinal = MachO::GET_LIBRARY_ORDINAL(NDesc);
+      if (LibraryOrdinal != 0 &&
+          LibraryOrdinal != MachO::EXECUTABLE_ORDINAL &&
+          LibraryOrdinal != MachO::DYNAMIC_LOOKUP_ORDINAL &&
+          LibraryOrdinal - 1 >= Libraries.size() ) {
+        return malformedError("bad library ordinal: " + Twine(LibraryOrdinal) +
+                            " for symbol at index " + Twine(SymbolIndex));
+      }
+    }
+    if (NStrx >= S.strsize)
+      return malformedError("bad string table index: " + Twine((int)NStrx) +
+                            " past the end of string table, for symbol at "
+                            "index " + Twine(SymbolIndex));
+    SymbolIndex++;
+  }
+  return Error::success();
 }
 
 void MachOObjectFile::moveSymbolNext(DataRefImpl &Symb) const {

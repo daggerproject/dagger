@@ -2082,20 +2082,21 @@ unsigned DwarfLinker::shouldKeepVariableDIE(RelocationManager &RelocMgr,
 
   // Global variables with constant value can always be kept.
   if (!(Flags & TF_InFunctionScope) &&
-      Abbrev->findAttributeIndex(dwarf::DW_AT_const_value) != -1U) {
+      Abbrev->findAttributeIndex(dwarf::DW_AT_const_value)) {
     MyInfo.InDebugMap = true;
     return Flags | TF_Keep;
   }
 
-  uint32_t LocationIdx = Abbrev->findAttributeIndex(dwarf::DW_AT_location);
-  if (LocationIdx == -1U)
+  Optional<uint32_t> LocationIdx =
+      Abbrev->findAttributeIndex(dwarf::DW_AT_location);
+  if (!LocationIdx)
     return Flags;
 
   uint32_t Offset = DIE.getOffset() + getULEB128Size(Abbrev->getCode());
   const DWARFUnit &OrigUnit = Unit.getOrigUnit();
   uint32_t LocationOffset, LocationEndOffset;
   std::tie(LocationOffset, LocationEndOffset) =
-      getAttributeOffsets(Abbrev, LocationIdx, Offset, OrigUnit);
+      getAttributeOffsets(Abbrev, *LocationIdx, Offset, OrigUnit);
 
   // See if there is a relocation to a valid debug map entry inside
   // this variable's location. The order is important here. We want to
@@ -2122,15 +2123,15 @@ unsigned DwarfLinker::shouldKeepSubprogramDIE(
 
   Flags |= TF_InFunctionScope;
 
-  uint32_t LowPcIdx = Abbrev->findAttributeIndex(dwarf::DW_AT_low_pc);
-  if (LowPcIdx == -1U)
+  Optional<uint32_t> LowPcIdx = Abbrev->findAttributeIndex(dwarf::DW_AT_low_pc);
+  if (!LowPcIdx)
     return Flags;
 
   uint32_t Offset = DIE.getOffset() + getULEB128Size(Abbrev->getCode());
   const DWARFUnit &OrigUnit = Unit.getOrigUnit();
   uint32_t LowPcOffset, LowPcEndOffset;
   std::tie(LowPcOffset, LowPcEndOffset) =
-      getAttributeOffsets(Abbrev, LowPcIdx, Offset, OrigUnit);
+      getAttributeOffsets(Abbrev, *LowPcIdx, Offset, OrigUnit);
 
   uint64_t LowPc =
       DIE.getAttributeValueAsAddress(&OrigUnit, dwarf::DW_AT_low_pc, -1ULL);
@@ -3294,7 +3295,7 @@ void DwarfLinker::loadClangModule(StringRef Filename, StringRef ModulePath,
     sys::path::append(Path, Filename);
   BinaryHolder ObjHolder(Options.Verbose);
   auto &Obj =
-      ModuleMap.addDebugMapObject(Path, sys::TimeValue::PosixZeroTime());
+      ModuleMap.addDebugMapObject(Path, sys::TimePoint<std::chrono::seconds>());
   auto ErrOrObj = loadObject(ObjHolder, Obj, ModuleMap);
   if (!ErrOrObj) {
     // Try and emit more helpful warnings by applying some heuristics.

@@ -102,6 +102,12 @@ static cl::opt<unsigned> PragmaUnrollThreshold(
     cl::desc("Unrolled size limit for loops with an unroll(full) or "
              "unroll_count pragma."));
 
+static cl::opt<unsigned> FlatLoopTripCountThreshold(
+    "flat-loop-tripcount-threshold", cl::init(5), cl::Hidden,
+    cl::desc("If the runtime tripcount for the loop is lower than the "
+             "threshold, the loop is considered as flat and will be less "
+             "aggressively unrolled."));
+
 /// A magic value for use with the Threshold parameter to indicate
 /// that the loop unroll should be performed regardless of how much
 /// code expansion would result.
@@ -126,6 +132,7 @@ static TargetTransformInfo::UnrollingPreferences gatherUnrollingPreferences(
   UP.DefaultUnrollRuntimeCount = 8;
   UP.MaxCount = UINT_MAX;
   UP.FullUnrollMaxCount = UINT_MAX;
+  UP.BEInsns = 2;
   UP.Partial = false;
   UP.Runtime = false;
   UP.AllowRemainder = true;
@@ -541,7 +548,7 @@ analyzeLoopUnrollCost(const Loop *L, unsigned TripCount, DominatorTree &DT,
 static unsigned ApproximateLoopSize(const Loop *L, unsigned &NumCalls,
                                     bool &NotDuplicatable, bool &Convergent,
                                     const TargetTransformInfo &TTI,
-                                    AssumptionCache *AC) {
+                                    AssumptionCache *AC, unsigned BEInsns) {
   SmallPtrSet<const Value *, 32> EphValues;
   CodeMetrics::collectEphemeralValues(L, AC, EphValues);
 
@@ -560,7 +567,7 @@ static unsigned ApproximateLoopSize(const Loop *L, unsigned &NumCalls,
   // that each loop has at least three instructions (likely a conditional
   // branch, a comparison feeding that branch, and some kind of loop increment
   // feeding that comparison instruction).
-  LoopSize = std::max(LoopSize, 3u);
+  LoopSize = std::max(LoopSize, BEInsns + 1);
 
   return LoopSize;
 }
@@ -699,6 +706,14 @@ static bool canUnrollCompletely(Loop *L, unsigned Threshold,
   return false;
 }
 
+// Returns loop size estimation for unrolled loop.
+static uint64_t getUnrolledLoopSize(
+    unsigned LoopSize,
+    TargetTransformInfo::UnrollingPreferences &UP) {
+  assert(LoopSize >= UP.BEInsns && "LoopSize should not be less than BEInsns!");
+  return (uint64_t)(LoopSize - UP.BEInsns) * UP.Count + UP.BEInsns;
+}
+
 // Returns true if unroll count was set explicitly.
 // Calculates unroll count and writes it to UP.Count.
 static bool computeUnrollCount(
@@ -706,11 +721,6 @@ static bool computeUnrollCount(
     ScalarEvolution *SE, OptimizationRemarkEmitter *ORE, unsigned &TripCount,
     unsigned MaxTripCount, unsigned &TripMultiple, unsigned LoopSize,
     TargetTransformInfo::UnrollingPreferences &UP, bool &UseUpperBound) {
-  // BEInsns represents number of instructions optimized when "back edge"
-  // becomes "fall through" in unrolled loop.
-  // For now we count a conditional branch on a backedge and a comparison
-  // feeding it.
-  unsigned BEInsns = 2;
   // Check for explicit Count.
   // 1st priority is unroll count set by "unroll-count" option.
   bool UserUnrollCount = UnrollCount.getNumOccurrences() > 0;
@@ -718,8 +728,7 @@ static bool computeUnrollCount(
     UP.Count = UnrollCount;
     UP.AllowExpensiveTripCount = true;
     UP.Force = true;
-    if (UP.AllowRemainder &&
-        (LoopSize - BEInsns) * UP.Count + BEInsns < UP.Threshold)
+    if (UP.AllowRemainder && getUnrolledLoopSize(LoopSize, UP) < UP.Threshold)
       return true;
   }
 
@@ -731,13 +740,13 @@ static bool computeUnrollCount(
     UP.AllowExpensiveTripCount = true;
     UP.Force = true;
     if (UP.AllowRemainder &&
-        (LoopSize - BEInsns) * UP.Count + BEInsns < PragmaUnrollThreshold)
+        getUnrolledLoopSize(LoopSize, UP) < PragmaUnrollThreshold)
       return true;
   }
   bool PragmaFullUnroll = HasUnrollFullPragma(L);
   if (PragmaFullUnroll && TripCount != 0) {
     UP.Count = TripCount;
-    if ((LoopSize - BEInsns) * UP.Count + BEInsns < PragmaUnrollThreshold)
+    if (getUnrolledLoopSize(LoopSize, UP) < PragmaUnrollThreshold)
       return false;
   }
 
@@ -745,7 +754,15 @@ static bool computeUnrollCount(
   bool ExplicitUnroll = PragmaCount > 0 || PragmaFullUnroll ||
                         PragmaEnableUnroll || UserUnrollCount;
 
-  uint64_t UnrolledSize;
+  // Check if the runtime trip count is too small when profile is available.
+  if (L->getHeader()->getParent()->getEntryCount() && TripCount == 0) {
+    if (auto ProfileTripCount = getLoopEstimatedTripCount(L)) {
+      if (*ProfileTripCount < FlatLoopTripCountThreshold)
+        return false;
+      else
+        UP.AllowExpensiveTripCount = true;
+    }
+  }
 
   if (ExplicitUnroll && TripCount != 0) {
     // If the loop has an unrolling pragma, we want to be more aggressive with
@@ -768,17 +785,16 @@ static bool computeUnrollCount(
   assert((ExactTripCount == 0 || MaxTripCount == 0) &&
          "ExtractTripCound and MaxTripCount cannot both be non zero.");
   unsigned FullUnrollTripCount = ExactTripCount ? ExactTripCount : MaxTripCount;
+  UP.Count = FullUnrollTripCount;
   if (FullUnrollTripCount && FullUnrollTripCount <= UP.FullUnrollMaxCount) {
     // When computing the unrolled size, note that BEInsns are not replicated
     // like the rest of the loop body.
-    UnrolledSize =
-        (uint64_t)(LoopSize - BEInsns) * FullUnrollTripCount + BEInsns;
     if (canUnrollCompletely(L, UP.Threshold, 100, UP.DynamicCostSavingsDiscount,
-                            UnrolledSize, UnrolledSize)) {
+                            getUnrolledLoopSize(LoopSize, UP),
+                            getUnrolledLoopSize(LoopSize, UP))) {
       UseUpperBound = (MaxTripCount == FullUnrollTripCount);
       TripCount = FullUnrollTripCount;
       TripMultiple = UP.UpperBound ? 1 : TripMultiple;
-      UP.Count = TripCount;
       return ExplicitUnroll;
     } else {
       // The loop isn't that small, but we still can fully unroll it if that
@@ -794,7 +810,6 @@ static bool computeUnrollCount(
           UseUpperBound = (MaxTripCount == FullUnrollTripCount);
           TripCount = FullUnrollTripCount;
           TripMultiple = UP.UpperBound ? 1 : TripMultiple;
-          UP.Count = TripCount;
           return ExplicitUnroll;
         }
     }
@@ -814,10 +829,10 @@ static bool computeUnrollCount(
       UP.Count = TripCount;
     if (UP.PartialThreshold != NoThreshold) {
       // Reduce unroll count to be modulo of TripCount for partial unrolling.
-      UnrolledSize = (uint64_t)(LoopSize - BEInsns) * UP.Count + BEInsns;
-      if (UnrolledSize > UP.PartialThreshold)
-        UP.Count = (std::max(UP.PartialThreshold, 3u) - BEInsns) /
-                   (LoopSize - BEInsns);
+      if (getUnrolledLoopSize(LoopSize, UP) > UP.PartialThreshold)
+        UP.Count =
+            (std::max(UP.PartialThreshold, UP.BEInsns + 1) - UP.BEInsns) /
+            (LoopSize - UP.BEInsns);
       if (UP.Count > UP.MaxCount)
         UP.Count = UP.MaxCount;
       while (UP.Count != 0 && TripCount % UP.Count != 0)
@@ -828,11 +843,9 @@ static bool computeUnrollCount(
         // As we'll create fixup loop, do the type of unrolling only if
         // remainder loop is allowed.
         UP.Count = UP.DefaultUnrollRuntimeCount;
-        UnrolledSize = (LoopSize - BEInsns) * UP.Count + BEInsns;
-        while (UP.Count != 0 && UnrolledSize > UP.PartialThreshold) {
+        while (UP.Count != 0 &&
+               getUnrolledLoopSize(LoopSize, UP) > UP.PartialThreshold)
           UP.Count >>= 1;
-          UnrolledSize = (LoopSize - BEInsns) * UP.Count + BEInsns;
-        }
       }
       if (UP.Count < 2) {
         if (PragmaEnableUnroll)
@@ -881,14 +894,12 @@ static bool computeUnrollCount(
   }
   if (UP.Count == 0)
     UP.Count = UP.DefaultUnrollRuntimeCount;
-  UnrolledSize = (LoopSize - BEInsns) * UP.Count + BEInsns;
 
   // Reduce unroll count to be the largest power-of-two factor of
   // the original count which satisfies the threshold limit.
-  while (UP.Count != 0 && UnrolledSize > UP.PartialThreshold) {
+  while (UP.Count != 0 &&
+         getUnrolledLoopSize(LoopSize, UP) > UP.PartialThreshold)
     UP.Count >>= 1;
-    UnrolledSize = (LoopSize - BEInsns) * UP.Count + BEInsns;
-  }
 
 #ifndef NDEBUG
   unsigned OrigCount = UP.Count;
@@ -944,8 +955,11 @@ static bool tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
   unsigned NumInlineCandidates;
   bool NotDuplicatable;
   bool Convergent;
+  TargetTransformInfo::UnrollingPreferences UP = gatherUnrollingPreferences(
+      L, TTI, ProvidedThreshold, ProvidedCount, ProvidedAllowPartial,
+      ProvidedRuntime, ProvidedUpperBound);
   unsigned LoopSize = ApproximateLoopSize(
-      L, NumInlineCandidates, NotDuplicatable, Convergent, TTI, &AC);
+      L, NumInlineCandidates, NotDuplicatable, Convergent, TTI, &AC, UP.BEInsns);
   DEBUG(dbgs() << "  Loop Size = " << LoopSize << "\n");
   if (NotDuplicatable) {
     DEBUG(dbgs() << "  Not unrolling loop which contains non-duplicatable"
@@ -976,10 +990,6 @@ static bool tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
     TripCount = SE->getSmallConstantTripCount(L, ExitingBlock);
     TripMultiple = SE->getSmallConstantTripMultiple(L, ExitingBlock);
   }
-
-  TargetTransformInfo::UnrollingPreferences UP = gatherUnrollingPreferences(
-      L, TTI, ProvidedThreshold, ProvidedCount, ProvidedAllowPartial,
-      ProvidedRuntime, ProvidedUpperBound);
 
   // Exit early if unrolling is disabled.
   if (UP.Threshold == 0 && (!UP.Partial || UP.PartialThreshold == 0))
