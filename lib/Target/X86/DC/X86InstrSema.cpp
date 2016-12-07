@@ -157,6 +157,10 @@ bool X86InstrSema::translateTargetInst() {
       switch (Opcode) {
       default:
         llvm_unreachable("Unknown rep-prefixed instruction");
+      case X86::RETQ: {
+        // Ignore the prefix in rep;ret.
+        return false;
+      }
       case X86::MOVSQ: SizeInBits = 64; break;
       case X86::MOVSL: SizeInBits = 32; break;
       case X86::MOVSW: SizeInBits = 16; break;
@@ -227,6 +231,7 @@ bool X86InstrSema::translateTargetInst() {
   case X86::NOOPL:
     return true;
 
+  case X86::HLT:
   case X86::XLAT:
   case X86::CPUID: {
     // FIXME: There's no reason to have a function, this is just a hack to get
