@@ -22,7 +22,24 @@ AArch64RegisterSema::AArch64RegisterSema(LLVMContext &Ctx,
                                          const MCRegisterInfo &MRI,
                                          const MCInstrInfo &MII,
                                          const DataLayout &DL)
-    : DCRegisterSema(Ctx, MRI, MII, DL, AArch64::RegClassVTs) {}
+    : DCRegisterSema(Ctx, MRI, MII, DL, AArch64::RegClassVTs) {
+  RegConstantVals[AArch64::XZR] =
+      Constant::getNullValue(IntegerType::get(Ctx, 64));
+  RegConstantVals[AArch64::WZR] =
+      Constant::getNullValue(IntegerType::get(Ctx, 32));
+}
+
+bool AArch64RegisterSema::doesSubRegIndexClearSuper(unsigned Idx) const {
+  switch (Idx) {
+  case AArch64::sub_32:
+  case AArch64::bsub:
+  case AArch64::hsub:
+  case AArch64::ssub:
+  case AArch64::dsub:
+    return true;
+  }
+  return false;
+}
 
 // FIXME: What about using the stuff in CallingConvLower.h?
 void AArch64RegisterSema::insertInitRegSetCode(Function *InitFn) {
