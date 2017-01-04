@@ -804,6 +804,9 @@ enum : unsigned {
   // Section data is string data by default.
   SHF_MIPS_STRING = 0x80000000,
 
+  // Make code section unreadable when in execute-only mode
+  SHF_ARM_PURECODE = 0x20000000,
+
   SHF_AMDGPU_HSA_GLOBAL = 0x00100000,
   SHF_AMDGPU_HSA_READONLY = 0x00200000,
   SHF_AMDGPU_HSA_CODE = 0x00400000,
@@ -1139,6 +1142,11 @@ enum {
   DT_VERDEFNUM = 0X6FFFFFFD,  // The number of entries in DT_VERDEF.
   DT_VERNEED = 0X6FFFFFFE,    // The address of the version Dependency table.
   DT_VERNEEDNUM = 0X6FFFFFFF, // The number of entries in DT_VERNEED.
+
+  // Hexagon specific dynamic table entries
+  DT_HEXAGON_SYMSZ = 0x70000000,
+  DT_HEXAGON_VER = 0x70000001,
+  DT_HEXAGON_PLT = 0x70000002,
 
   // Mips specific dynamic table entry tags.
   DT_MIPS_RLD_VERSION = 0x70000001,    // 32 bit version number for runtime
