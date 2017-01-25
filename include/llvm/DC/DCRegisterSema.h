@@ -35,6 +35,7 @@
 
 namespace llvm {
 class BasicBlock;
+class DCRegisterSetDesc;
 class DataLayout;
 class Function;
 class LLVMContext;
@@ -54,13 +55,9 @@ private:
   void operator=(const DCRegisterSema &) = delete;
 
 public:
-  typedef std::vector<unsigned> RegSizeTy;
-  typedef void (*InitSpecialRegSizesFnTy)(RegSizeTy &RegSizes);
-
   DCRegisterSema(LLVMContext &Ctx, const MCRegisterInfo &MRI,
                  const MCInstrInfo &MII, const DataLayout &DL,
-                 const MVT::SimpleValueType *RegClassVTs,
-                 InitSpecialRegSizesFnTy InitSpecialRegSizesFn = 0);
+                 const DCRegisterSetDesc &RegSetDesc);
   virtual ~DCRegisterSema();
 
   const MCRegisterInfo &MRI;
@@ -68,45 +65,8 @@ public:
 
   const DataLayout &DL;
   LLVMContext &Ctx;
-  StructType *RegSetType;
 
-private:
-  // Reg* vectors contain all MRI.getNumRegs() registers.
-  unsigned NumRegs;
-  // Largest* vectors contain NumLargest registers.
-  unsigned NumLargest;
-
-protected:
-  unsigned getNumRegs() const { return NumRegs; }
-  unsigned getNumLargest() const { return NumLargest; }
-
-  // The size of each register, in bits.
-  RegSizeTy RegSizes;
-
-  // The type of each register (the first type of the last register class
-  // containing the register).
-  // FIXME: Is there a better heuristic for register class selection?
-  std::vector<Type *> RegTypes;
-
-  // The largest super register of each register, 0 if undefined, itself if the
-  // register has no super-register.
-  std::vector<unsigned> RegLargestSupers;
-
-  // Whether a register partially aliases other registers: this is usually the
-  // case for tuples of registers, which alias the other permutations.
-  // These registers don't participate in the regset and are materialized lazily
-  // from their sub-registers.
-  std::vector<bool> RegAliased;
-
-  // The offset of each register in RegSetType, or -1 if not present.
-  // Only the largest super registers are present, meaning there are only
-  // NumLargest elements not equal to -1.
-  std::vector<int> RegOffsetsInSet;
-
-  std::vector<unsigned> LargestRegs;
-
-  // Always valid inside a context.
-  std::vector<Constant *> RegConstantVals;
+  const DCRegisterSetDesc &RegSetDesc;
 
   // Valid only inside a Module.
   Module *TheModule;
@@ -141,14 +101,13 @@ protected:
   virtual void onRegisterSet(unsigned RegNo, Value *Val) {}
 
 public:
-  StructType *getRegSetType() const { return RegSetType; }
-  // Compute the register's offset in bytes from the start of the regset.
-  // Also return it's size in bytes.
-  std::pair<size_t, size_t> getRegSizeOffsetInRegSet(unsigned RegNo) const;
+  const DCRegisterSetDesc &getRegSetDesc() const { return RegSetDesc; }
+  unsigned getNumRegs() const;
+  StructType *getRegSetType() const;
 
   // Returns the regset diff function, that prints to stderr:
   //     void @__llvm_dc_print_regset_diff(i8* fn, %regset* v1, %regset* v2)
-  Function *getOrCreateRegSetDiffFunction(bool Definition = false);
+  Function *getOrCreateRegSetDiffFunction();
 
   virtual void SwitchToModule(Module *TheModule);
   virtual void SwitchToFunction(Function *TheFunction);
@@ -158,6 +117,7 @@ public:
   virtual void FinalizeFunction(BasicBlock *ExitBB);
   virtual void FinalizeBasicBlock();
 
+  void saveAllLiveRegs();
   void saveAllLocalRegs(BasicBlock *BB, BasicBlock::iterator IP);
   void restoreLocalRegs(BasicBlock *BB, BasicBlock::iterator IP);
 
@@ -181,11 +141,6 @@ public:
   Value *getRegAsInt(unsigned RegNo) {
     return Builder->CreateBitCast(getReg(RegNo), getRegIntType(RegNo));
   }
-
-  // Fill 2 functions, main_{init,fini}_regset, to initialize a regset from
-  // a stack pointer and ac/av, and to extract the return value.
-  virtual void insertInitRegSetCode(Function *InitFn) = 0;
-  virtual void insertFiniRegSetCode(Function *FiniFn) = 0;
 
   virtual void insertExternalWrapperAsm(BasicBlock *WrapperBB,
                                         Value *ExtFn) = 0;

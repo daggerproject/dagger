@@ -3,9 +3,11 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/ValueTracking.h"
-#include "llvm/DC/DCInstrSema.h"
+#include "llvm/DC/DCFunction.h"
 #include "llvm/DC/DCRegisterSema.h"
 #include "llvm/DC/DCTranslator.h"
+#include "llvm/DC/DCTranslatorUtils.h"
+#include "llvm/DC/LowerDCTranslateAt.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/LambdaResolver.h"
@@ -127,6 +129,8 @@ static OwningBinary<MachOObjectFile> openObjectFileAtPath(StringRef Path) {
   return OwningBinary<MachOObjectFile>(std::move(MOOF), std::move(Buf));
 }
 
+static void *__llvm_dc_translate_at(void *addr);
+
 template <typename T>
 static std::vector<T> singletonSet(T t) {
   std::vector<T> Vec;
@@ -143,7 +147,8 @@ public:
   typedef LazyEmitLayerT::ModuleSetHandleT ModuleHandleT;
 
   DYNJIT(TargetMachine &TM)
-      : DL(TM.createDataLayout()), CompileLayer(ObjectLayer, SimpleCompiler(TM)),
+      : DL(TM.createDataLayout()),
+        CompileLayer(ObjectLayer, SimpleCompiler(TM)),
         LazyEmitLayer(CompileLayer) {}
 
   std::string mangle(const std::string &Name) {
@@ -155,9 +160,33 @@ public:
     return MangledName;
   }
 
+  void runPassesOnModule(Module &M) {
+    if (!LowerDCTranslateAtPass) {
+      auto *PI8Ty = Type::getInt8PtrTy(M.getContext());
+      auto *I64Ty = Type::getInt64Ty(M.getContext());
+
+      FunctionType *CallbackType =
+          FunctionType::get(PI8Ty, PI8Ty, /*isVarArg=*/false);
+
+      Value *TranslateAtFn = ConstantExpr::getIntToPtr(
+          ConstantInt::get(
+              I64Ty, reinterpret_cast<uintptr_t>(&__llvm_dc_translate_at)),
+          CallbackType->getPointerTo());
+
+      LowerDCTranslateAtPass.reset(createLowerDCTranslateAtPass(TranslateAtFn));
+
+      PM.add(LowerDCTranslateAtPass.get());
+    }
+
+    PM.run(M);
+  }
+
   ModuleHandleT addModule(Module *M) {
     // Dump the IR we found.
     DEBUG(M->dump());
+
+    runPassesOnModule(*M);
+
     // We need a memory manager to allocate memory and resolve symbols for this
     // new module. Create one that resolves symbols by looking back into the
     // JIT.
@@ -192,6 +221,9 @@ private:
   ObjLayerT ObjectLayer;
   CompileLayerT CompileLayer;
   LazyEmitLayerT LazyEmitLayer;
+
+  std::unique_ptr<Pass> LowerDCTranslateAtPass;
+  legacy::PassManager PM;
 };
 
 static uint64_t loadRegFromSet(uint8_t *RegSet, unsigned Offset, unsigned Size){
@@ -209,6 +241,9 @@ static uint64_t loadRegFromSet(uint8_t *RegSet, unsigned Offset, unsigned Size){
 }
 
 static DCTranslator *__dc_DT;
+static MCModule *__dc_MCM;
+static MCObjectSymbolizer *__dc_MOS;
+static MCObjectDisassembler *__dc_MCOD;
 static DYNJIT *__dc_JIT;
 
 // FIXME: We need to handle cache invalidation when functions are freed.
@@ -216,7 +251,7 @@ static DYNJIT *__dc_JIT;
 
 static void *__llvm_dc_translate_at(void *addr) {
   void *ptr = nullptr;
-  Function *F = __dc_DT->translateRecursivelyAt((uint64_t)addr);
+  Function *F = translateRecursivelyAt((uint64_t)addr, *__dc_DT, *__dc_MCM, __dc_MCOD, __dc_MOS);
   DEBUG(dbgs() << "__llvm_dc_translate_at " << addr << "\n");
   DEBUG(dbgs() << "Jumping to " << F->getName() << "\n");
   ptr = (void*)__dc_JIT->findUnmangledSymbol(F->getName()).getAddress();
@@ -370,21 +405,12 @@ void dyn_entry(int argc, char **argv, const char **envp, const char **apple,
   const DataLayout DL = TM->createDataLayout();
   LLVMContext Ctx;
 
-  std::unique_ptr<DCRegisterSema> DRS(
-      TheTarget->createDCRegisterSema(TripleName, Ctx, *MRI, *MII, DL));
-  if (!DRS) {
-    errs() << "error: no dc register sema for target " << TripleName << "\n";
+  std::unique_ptr<DCTranslator> DT(TheTarget->createDCTranslator(
+      Triple(TripleName), Ctx, DL, /*OptLevel=*/2, *MII, *MRI));
+  if (!DT) {
+    errs() << "error: no dc translator for target " << TripleName << "\n";
     exit(1);
   }
-  std::unique_ptr<DCInstrSema> DIS(
-      TheTarget->createDCInstrSema(TripleName, *DRS, *MRI, *MII));
-  if (!DIS) {
-    errs() << "error: no dc instruction sema for target " << TripleName << "\n";
-    exit(1);
-  }
-
-  DIS->setDynTranslateAtCallback(
-      reinterpret_cast<void *>(&__llvm_dc_translate_at));
 
   // Add the program's symbols into the JIT's search space.
   if (sys::DynamicLibrary::LoadLibraryPermanently(nullptr)) {
@@ -394,30 +420,30 @@ void dyn_entry(int argc, char **argv, const char **envp, const char **apple,
 
   DYNJIT J(*TM);
 
-  std::unique_ptr<DCTranslator> DT(new DCTranslator(Ctx, DL, TransOpt::Default,
-                                                    *DIS, *DRS, *MIP, *STI,
-                                                    *MCM, OD.get(), MOS.get()));
-
   __dc_DT = DT.get();
+  __dc_MCM = MCM.get();
+  __dc_MOS = MOS.get();
+  __dc_MCOD = OD.get();
   __dc_JIT = &J;
 
   // Now run it !
 
   // First, get the init/fini functions.
-  Function *InitRegSetFn = DT->getInitRegSetFunction();
-  Function *FiniRegSetFn = DT->getFiniRegSetFunction();
+  Function *InitRegSetFn = DT->getDCModule()->getOrCreateInitRegSetFunction();
+  Function *FiniRegSetFn = DT->getDCModule()->getOrCreateFiniRegSetFunction();
 
   // Add these to the JIT.
   J.addModule(DT->finalizeTranslationModule());
 
-  const StructLayout *SL = DL.getStructLayout(DRS->getRegSetType());
+  const StructLayout *SL = DL.getStructLayout(DT->getRegSetDesc().RegSetType);
   std::vector<uint8_t> RegSet(SL->getSizeInBytes());
   const unsigned StackSize = 4096 * 1024;
   std::vector<uint8_t> StackPtr(StackSize);
 
   unsigned RegSetPCSize, RegSetPCOffset;
   std::tie(RegSetPCSize, RegSetPCOffset) =
-      DRS->getRegSizeOffsetInRegSet(MRI->getProgramCounter());
+      DT->getRegSetDesc().getRegSizeOffsetInRegSet(MRI->getProgramCounter(), DL,
+                                                   *MRI);
 
   auto InitRegSetFnFP =
       (void (*)(uint8_t *, uint8_t *, uint32_t, uint32_t, char **))
@@ -447,8 +473,8 @@ void dyn_entry(int argc, char **argv, const char **envp, const char **apple,
     std::vector<Function *> TranslatedFns;
     TranslatedFns.reserve(Fns.size());
     for (auto FnAddr : Fns)
-      TranslatedFns.push_back(
-          DT->translateRecursivelyAt(MOS->getEffectiveLoadAddr(FnAddr)));
+      TranslatedFns.push_back(translateRecursivelyAt(
+          MOS->getEffectiveLoadAddr(FnAddr), *DT, *MCM, OD.get(), MOS.get()));
 
     // Add these to the JIT, and run them.
     Module *M = DT->finalizeTranslationModule();
@@ -476,7 +502,8 @@ void dyn_entry(int argc, char **argv, const char **envp, const char **apple,
   uint64_t CurPC = MOS->getEffectiveLoadAddr(*MainEntrypoint);
   assert(dlsym(RTLD_MAIN_ONLY, "main") == (void *)CurPC);
   do {
-    Function *Fn = DT->translateRecursivelyAt(CurPC);
+    Function *Fn =
+        translateRecursivelyAt(CurPC, *DT, *MCM, OD.get(), MOS.get());
     DEBUG(dbgs() << "Executing function " << Fn->getName() << "\n");
     J.addModule(DT->finalizeTranslationModule());
     RunIRFunction(Fn);

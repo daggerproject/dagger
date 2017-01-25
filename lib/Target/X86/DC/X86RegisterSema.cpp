@@ -11,6 +11,7 @@
 #include "X86.h"
 #include "X86InstrInfo.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/DC/DCRegisterSetDesc.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
@@ -25,23 +26,13 @@ using namespace llvm;
 
 #define DEBUG_TYPE "x86-dc-regsema"
 
-static void X86InitSpecialRegSizes(DCRegisterSema::RegSizeTy &RegSizes) {
-  // IP and EIP don't have register classes, but RIP does.
-  assert(RegSizes[X86::IP] == 0);
-  assert(RegSizes[X86::EIP] == 0);
-  assert(RegSizes[X86::RIP] == 64);
-  RegSizes[X86::IP] = 16;
-  RegSizes[X86::EIP] = 32;
-}
-
 X86RegisterSema::X86RegisterSema(LLVMContext &Ctx, const MCRegisterInfo &MRI,
-                                 const MCInstrInfo &MII, const DataLayout &DL)
-    : DCRegisterSema(Ctx, MRI, MII, DL, X86::RegClassVTs,
-                     X86InitSpecialRegSizes),
-      LastEFLAGSChangingDef(0), LastEFLAGSDef(0),
-      LastEFLAGSDefWasPartialINCDEC(false), SFVals(X86::MAX_FLAGS + 1),
-      SFAssignments(X86::MAX_FLAGS + 1), CCVals(X86::COND_INVALID),
-      CCAssignments(X86::COND_INVALID) {}
+                                 const MCInstrInfo &MII, const DataLayout &DL,
+                                 const DCRegisterSetDesc &RegSetDesc)
+    : DCRegisterSema(Ctx, MRI, MII, DL, RegSetDesc), LastEFLAGSChangingDef(0),
+      LastEFLAGSDef(0), LastEFLAGSDefWasPartialINCDEC(false),
+      SFVals(X86::MAX_FLAGS + 1), SFAssignments(X86::MAX_FLAGS + 1),
+      CCVals(X86::COND_INVALID), CCAssignments(X86::COND_INVALID) {}
 
 bool X86RegisterSema::doesSubRegIndexClearSuper(unsigned SubRegIdx) const {
   if (SubRegIdx == X86::sub_32bit)
@@ -96,7 +87,7 @@ void X86RegisterSema::FinalizeBasicBlock() {
   clearCCSF();
 }
 
-void X86RegisterSema::FinalizeFunction(BasicBlock* ExitBB) {
+void X86RegisterSema::FinalizeFunction(BasicBlock *ExitBB) {
   DCRegisterSema::FinalizeFunction(ExitBB);
   for (size_t i = 0, e = CCAssignments.size(); i != e; ++i)
     CCAssignments[i] = 0;
@@ -105,36 +96,59 @@ void X86RegisterSema::FinalizeFunction(BasicBlock* ExitBB) {
 }
 
 static StringRef getSFName(X86::StatusFlag SF) {
-  switch(SF) {
-  case X86::SF: return "SF";
-  case X86::CF: return "CF";
-  case X86::PF: return "PF";
-  case X86::AF: return "AF";
-  case X86::ZF: return "ZF";
-  case X86::OF: return "OF";
+  switch (SF) {
+  case X86::SF:
+    return "SF";
+  case X86::CF:
+    return "CF";
+  case X86::PF:
+    return "PF";
+  case X86::AF:
+    return "AF";
+  case X86::ZF:
+    return "ZF";
+  case X86::OF:
+    return "OF";
   }
   llvm_unreachable("Unknown status flag.");
 }
 
 static StringRef getCCName(X86::CondCode CC) {
-  switch(CC) {
-  case X86::COND_NO: return "CC_NO";
-  case X86::COND_O:  return "CC_O";
-  case X86::COND_AE: return "CC_AE";
-  case X86::COND_B:  return "CC_B";
-  case X86::COND_NE: return "CC_NE";
-  case X86::COND_E:  return "CC_E";
-  case X86::COND_NS: return "CC_NS";
-  case X86::COND_S:  return "CC_S";
-  case X86::COND_NP: return "CC_NP";
-  case X86::COND_P:  return "CC_P";
-  case X86::COND_A:  return "CC_A";
-  case X86::COND_BE: return "CC_BE";
-  case X86::COND_GE: return "CC_GE";
-  case X86::COND_L:  return "CC_L";
-  case X86::COND_G:  return "CC_G";
-  case X86::COND_LE: return "CC_LE";
-  default: return "";
+  switch (CC) {
+  case X86::COND_NO:
+    return "CC_NO";
+  case X86::COND_O:
+    return "CC_O";
+  case X86::COND_AE:
+    return "CC_AE";
+  case X86::COND_B:
+    return "CC_B";
+  case X86::COND_NE:
+    return "CC_NE";
+  case X86::COND_E:
+    return "CC_E";
+  case X86::COND_NS:
+    return "CC_NS";
+  case X86::COND_S:
+    return "CC_S";
+  case X86::COND_NP:
+    return "CC_NP";
+  case X86::COND_P:
+    return "CC_P";
+  case X86::COND_A:
+    return "CC_A";
+  case X86::COND_BE:
+    return "CC_BE";
+  case X86::COND_GE:
+    return "CC_GE";
+  case X86::COND_L:
+    return "CC_L";
+  case X86::COND_G:
+    return "CC_G";
+  case X86::COND_LE:
+    return "CC_LE";
+  default:
+    return "";
   }
 }
 
@@ -147,23 +161,51 @@ Value *X86RegisterSema::getCC(X86::CondCode CC) {
   bool XOF = false; // Needs XOR OF
   bool OZF = false; // Needs OR ZF
   X86::StatusFlag SF;
-  switch(CC) {
-  case X86::COND_NO: Inv = true;
-  case X86::COND_O: SF = X86::OF; break;
-  case X86::COND_AE: Inv = true;
-  case X86::COND_B: SF = X86::CF; break;
-  case X86::COND_NE: Inv = true;
-  case X86::COND_E: SF = X86::ZF; break;
-  case X86::COND_NS: Inv = true;
-  case X86::COND_S: SF = X86::SF; break;
-  case X86::COND_NP: Inv = true;
-  case X86::COND_P: SF = X86::PF; break;
-  case X86::COND_A: Inv = true;
-  case X86::COND_BE: SF = X86::CF; OZF = true; break;
-  case X86::COND_GE: Inv = true;
-  case X86::COND_L: SF = X86::SF; XOF = true; break;
-  case X86::COND_G: Inv = true;
-  case X86::COND_LE: SF = X86::SF; XOF = true; OZF = true; break;
+  switch (CC) {
+  case X86::COND_NO:
+    Inv = true;
+  case X86::COND_O:
+    SF = X86::OF;
+    break;
+  case X86::COND_AE:
+    Inv = true;
+  case X86::COND_B:
+    SF = X86::CF;
+    break;
+  case X86::COND_NE:
+    Inv = true;
+  case X86::COND_E:
+    SF = X86::ZF;
+    break;
+  case X86::COND_NS:
+    Inv = true;
+  case X86::COND_S:
+    SF = X86::SF;
+    break;
+  case X86::COND_NP:
+    Inv = true;
+  case X86::COND_P:
+    SF = X86::PF;
+    break;
+  case X86::COND_A:
+    Inv = true;
+  case X86::COND_BE:
+    SF = X86::CF;
+    OZF = true;
+    break;
+  case X86::COND_GE:
+    Inv = true;
+  case X86::COND_L:
+    SF = X86::SF;
+    XOF = true;
+    break;
+  case X86::COND_G:
+    Inv = true;
+  case X86::COND_LE:
+    SF = X86::SF;
+    XOF = true;
+    OZF = true;
+    break;
   case X86::COND_NE_OR_P:
   case X86::COND_E_AND_NP:
   case X86::COND_INVALID:
@@ -194,16 +236,16 @@ Value *X86RegisterSema::getEFLAGSforCMP(Value *LHS, Value *RHS) {
   if (RHS->getType()->isIntegerTy()) {
     // FIXME: the ultimate goal is to make this transparent, depending on the
     // operation that updated the flags.
-    setCC(X86::COND_A,  Builder->CreateICmpUGT(LHS, RHS));
+    setCC(X86::COND_A, Builder->CreateICmpUGT(LHS, RHS));
     setCC(X86::COND_AE, Builder->CreateICmpUGE(LHS, RHS));
-    setCC(X86::COND_B,  Builder->CreateICmpULT(LHS, RHS));
+    setCC(X86::COND_B, Builder->CreateICmpULT(LHS, RHS));
     setCC(X86::COND_BE, Builder->CreateICmpULE(LHS, RHS));
-    setCC(X86::COND_L,  Builder->CreateICmpSLT(LHS, RHS));
+    setCC(X86::COND_L, Builder->CreateICmpSLT(LHS, RHS));
     setCC(X86::COND_LE, Builder->CreateICmpSLE(LHS, RHS));
-    setCC(X86::COND_G,  Builder->CreateICmpSGT(LHS, RHS));
+    setCC(X86::COND_G, Builder->CreateICmpSGT(LHS, RHS));
     setCC(X86::COND_GE, Builder->CreateICmpSGE(LHS, RHS));
-    setCC(X86::COND_E,  Builder->CreateICmpEQ  (LHS, RHS));
-    setCC(X86::COND_NE, Builder->CreateICmpNE (LHS, RHS));
+    setCC(X86::COND_E, Builder->CreateICmpEQ(LHS, RHS));
+    setCC(X86::COND_NE, Builder->CreateICmpNE(LHS, RHS));
     // Per the intel manual, CMP is equivalent to SUB.
     return computeEFLAGSForDef(Builder->CreateSub(LHS, RHS));
   } else {
@@ -255,7 +297,7 @@ Value *X86RegisterSema::computeEFLAGSForDef(Value *Def, bool DontUpdateCF) {
   }
 
   if (BinOp && OverflowIntrinsic && CarryIntrinsic) {
-    Value *Args[] = { BinOp->getOperand(0), BinOp->getOperand(1) };
+    Value *Args[] = {BinOp->getOperand(0), BinOp->getOperand(1)};
     setSF(X86::OF, Builder->CreateExtractValue(
                        Builder->CreateCall(
                            Intrinsic::getDeclaration(
@@ -305,8 +347,8 @@ void X86RegisterSema::setSF(X86::StatusFlag SF, Value *Val) {
   // No need to recreate EFLAGS, because this is only called from updateEFLAGS.
   SFVals[SF] = Val;
   if (!Val->hasName())
-    Val->setName((Twine(getSFName(SF)) + "_" +
-                  utostr(SFAssignments[SF]++)).str());
+    Val->setName(
+        (Twine(getSFName(SF)) + "_" + utostr(SFAssignments[SF]++)).str());
 }
 
 Value *X86RegisterSema::getSF(X86::StatusFlag SF) {
@@ -318,75 +360,17 @@ Value *X86RegisterSema::getSF(X86::StatusFlag SF) {
   return SV;
 }
 
-// FIXME: this is all very much amd64 sysv specific
-// What about using the stuff in CallingConvLower.h?
-void X86RegisterSema::insertInitRegSetCode(Function *InitFn) {
-  IRBuilderBase::InsertPointGuard IPG(*Builder);
-  Type *I64Ty = Builder->getInt64Ty();
-  Builder->SetInsertPoint(BasicBlock::Create(Ctx, "", InitFn));
-
-  Function::arg_iterator ArgI = InitFn->getArgumentList().begin();
-  Value *RegSet = &*ArgI++;
-  Value *StackPtr = &*ArgI++;
-  Value *StackSize = &*ArgI++;
-  Value *ArgC = &*ArgI++;
-  Value *ArgV = &*ArgI++;
-
-  // Initialize RSP to point to the end of the stack
-  Value *RSP = Builder->CreatePtrToInt(StackPtr, I64Ty);
-  RSP = Builder->CreateAdd(RSP, Builder->CreateZExtOrBitCast(StackSize, I64Ty));
-
-  // push ~0 to simulate a call
-  RSP = Builder->CreateSub(RSP, Builder->getInt64(8));
-  Builder->CreateStore(Builder->getInt(APInt::getAllOnesValue(64)),
-                       Builder->CreateIntToPtr(RSP, I64Ty->getPointerTo()));
-
-  auto InitRegTo = [&](unsigned RegNo, Value *Val) {
-    unsigned RegLargestSuper = RegLargestSupers[RegNo];
-    assert(RegLargestSuper == RegNo);
-    unsigned RegOffsetInSet = RegOffsetsInSet[RegLargestSuper];
-    Value *Idx[] = {Builder->getInt32(0), Builder->getInt32(RegOffsetInSet)};
-    Builder->CreateStore(Val, Builder->CreateInBoundsGEP(RegSet, Idx));
-  };
-
-  // put a pointer to the test stack in RSP
-  InitRegTo(X86::RSP, RSP);
-  // ac comes in EDI
-  InitRegTo(X86::RDI, Builder->CreateZExt(ArgC, Builder->getInt64Ty()));
-  // av comes in RSI
-  InitRegTo(X86::RSI, Builder->CreatePtrToInt(ArgV, Builder->getInt64Ty()));
-  // Initialize EFLAGS to 0x202 (empirical).
-  InitRegTo(X86::EFLAGS, Builder->getInt32(0x202));
-  InitRegTo(X86::CtlSysEFLAGS, Builder->getInt32(0x202));
-
-  Builder->CreateRetVoid();
-}
-
-void X86RegisterSema::insertFiniRegSetCode(Function *FiniFn) {
-  IRBuilderBase::InsertPointGuard IPG(*Builder);
-  Value *Idx[] = {Builder->getInt32(0), 0};
-  Builder->SetInsertPoint(BasicBlock::Create(Ctx, "", FiniFn));
-
-  Function::arg_iterator ArgI = FiniFn->getArgumentList().begin();
-  Value *RegSet = &*ArgI;
-
-  // Result comes out of EAX
-  Idx[1] = Builder->getInt32(RegOffsetsInSet[RegLargestSupers[X86::EAX]]);
-  Builder->CreateRet(Builder->CreateTrunc(
-      Builder->CreateLoad(Builder->CreateInBoundsGEP(RegSet, Idx)),
-      Builder->getInt32Ty()));
-}
-
 void X86RegisterSema::insertExternalWrapperAsm(BasicBlock *WrapperBB,
                                                Value *ExtFn) {
   DCIRBuilder WBuilder(WrapperBB);
 
   SmallVector<Type *, 20> IAArgTypes;
-  IAArgTypes.push_back(RegSetType->getPointerTo());
+  IAArgTypes.push_back(getRegSetType()->getPointerTo());
   IAArgTypes.push_back(ExtFn->getType());
 
-  auto getRegOffset =
-      [this](unsigned Reg) { return getRegSizeOffsetInRegSet(Reg).second; };
+  auto getRegOffset = [this](unsigned Reg) {
+    return getRegSetDesc().getRegSizeOffsetInRegSet(Reg, DL, MRI).second;
+  };
 
   std::string IAStr;
   raw_string_ostream(IAStr)
@@ -447,6 +431,6 @@ void X86RegisterSema::insertExternalWrapperAsm(BasicBlock *WrapperBB,
              "~{xmm0},~{xmm1},~{xmm2},~{xmm3},~{xmm4},~{xmm5},~{xmm6},~{xmm7}",
       /*hasSideEffects=*/true, /*isAlignStack=*/false);
 
-   Value *RegSetPtr = &*WrapperBB->getParent()->getArgumentList().begin();
-   WBuilder.CreateCall(IA, {RegSetPtr, ExtFn});
+  Value *RegSetPtr = &*WrapperBB->getParent()->getArgumentList().begin();
+  WBuilder.CreateCall(IA, {RegSetPtr, ExtFn});
 }

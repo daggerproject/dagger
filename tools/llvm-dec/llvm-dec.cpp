@@ -1,15 +1,15 @@
 #define DEBUG_TYPE "llvm-dec"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Triple.h"
-#include "llvm/DC/DCInstrSema.h"
-#include "llvm/DC/DCRegisterSema.h"
+#include "llvm/DC/DCModule.h"
 #include "llvm/DC/DCTranslator.h"
-#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/DC/DCTranslatorUtils.h"
 #include "llvm/MC/MCAnalysis/MCCachingDisassembler.h"
 #include "llvm/MC/MCAnalysis/MCFunction.h"
 #include "llvm/MC/MCAnalysis/MCModule.h"
 #include "llvm/MC/MCAnalysis/MCObjectDisassembler.h"
 #include "llvm/MC/MCAnalysis/MCObjectSymbolizer.h"
+#include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCInst.h"
@@ -45,10 +45,6 @@ static cl::opt<unsigned long long>
 TranslationEntrypoint("entrypoint",
                       cl::desc("Address to start translating from "
                                "(default = object entrypoint)"));
-
-static cl::opt<bool>
-AnnotateIROutput("annot", cl::desc("Enable IR output anotations"),
-                 cl::init(false));
 
 static cl::opt<unsigned>
 TransOptLevel("O",
@@ -196,58 +192,37 @@ int main(int argc, char **argv) {
   if (!MCM)
     return 1;
 
-  TransOpt::Level TOLvl;
-  switch (TransOptLevel) {
-  default:
+  if (TransOptLevel > 3) {
     errs() << ToolName << ": invalid optimization level.\n";
     return 1;
-  case 0: TOLvl = TransOpt::None; break;
-  case 1: TOLvl = TransOpt::Less; break;
-  case 2: TOLvl = TransOpt::Default; break;
-  case 3: TOLvl = TransOpt::Aggressive; break;
   }
+
 
   // FIXME: should we have a non-default datalayout?
   DataLayout DL("");
 
   LLVMContext Ctx;
 
-  std::unique_ptr<DCRegisterSema> DRS(
-      TheTarget->createDCRegisterSema(TripleName, Ctx, *MRI, *MII, DL));
-  if (!DRS) {
-    errs() << "error: no dc register sema for target " << TripleName << "\n";
+  std::unique_ptr<DCTranslator> DT(TheTarget->createDCTranslator(
+      Triple(TripleName), Ctx, DL, TransOptLevel, *MII, *MRI));
+  if (!DT) {
+    errs() << "error: no dc translator for target " << TripleName << "\n";
     return 1;
   }
-  std::unique_ptr<DCInstrSema> DIS(
-      TheTarget->createDCInstrSema(TripleName, *DRS, *MRI, *MII));
-  if (!DIS) {
-    errs() << "error: no dc instruction sema for target " << TripleName << "\n";
-    return 1;
-  }
-
-  std::unique_ptr<DCTranslator> DT(
-      new DCTranslator(Ctx, DL, TOLvl, *DIS, *DRS, *MIP, *STI, *MCM, OD.get(),
-                       MOS.get(), AnnotateIROutput));
 
   if (!TranslationEntrypoint) {
     if (auto MainEntrypoint = MOS->getMainEntrypoint())
       TranslationEntrypoint = *MainEntrypoint;
   }
 
-  DT->createMainFunctionWrapper(
-      DT->translateRecursivelyAt(TranslationEntrypoint));
+  DT->getDCModule()->getOrCreateMainFunction(translateRecursivelyAt(
+      TranslationEntrypoint, *DT, *MCM, OD.get(), MOS.get()));
 
   for (auto &F : MCM->funcs())
-    DT->translateRecursivelyAt(F->getStartAddr());
+    translateRecursivelyAt(F->getStartAddr(), *DT, *MCM, OD.get(), MOS.get());
 
-  std::unique_ptr<DCTranslatedInstTracker> DTIT;
-  Module *M = DT->finalizeTranslationModule(&DTIT);
-  std::unique_ptr<DCAnnotationWriter> AnnotWriter;
-  if (AnnotateIROutput) {
-    assert(DTIT.get() && "Unexpected missing translated inst tracker!");
-    AnnotWriter.reset(new DCAnnotationWriter(*DTIT, *MRI, *MIP, *STI));
-  }
-  M->print(outs(), AnnotWriter.get());
+  Module *M = DT->finalizeTranslationModule();
+  M->print(outs(), /*AnnotWriter=*/nullptr);
 
   return 0;
 }
