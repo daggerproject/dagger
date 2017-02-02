@@ -34,9 +34,8 @@ env:
 
 script:
   - mkdir build && cd build
-  - cmake .. -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS="${LLVM_ENABLE_ASSERTIONS}" -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS_TO_BUILD}"
-  - make -j3
-  - ./bin/llvm-lit -v test/DC test/MC/Analysis test/tools/llvm-objdump
+  - cmake .. -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS="${LLVM_ENABLE_ASSERTIONS}" -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS_TO_BUILD}" -DLLVM_LIT_ARGS="-v"
+  - make -j4 check-dagger
 
 notifications:
   email:
