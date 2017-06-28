@@ -7,6 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/MC/MCAssembler.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -16,7 +17,6 @@
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAsmLayout.h"
-#include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCCodeView.h"
 #include "llvm/MC/MCContext.h"
@@ -37,9 +37,9 @@
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
-#include <cstring>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <tuple>
 #include <utility>
 
@@ -193,13 +193,22 @@ bool MCAssembler::evaluateFixup(const MCAsmLayout &Layout,
   // FIXME: This code has some duplication with recordRelocation. We should
   // probably merge the two into a single callback that tries to evaluate a
   // fixup and records a relocation if one is needed.
+
+  // On error claim to have completely evaluated the fixup, to prevent any
+  // further processing from being done.
   const MCExpr *Expr = Fixup.getValue();
+  MCContext &Ctx = getContext();
+  Value = 0;
   if (!Expr->evaluateAsRelocatable(Target, &Layout, &Fixup)) {
-    getContext().reportError(Fixup.getLoc(), "expected relocatable expression");
-    // Claim to have completely evaluated the fixup, to prevent any further
-    // processing from being done.
-    Value = 0;
+    Ctx.reportError(Fixup.getLoc(), "expected relocatable expression");
     return true;
+  }
+  if (const MCSymbolRefExpr *RefB = Target.getSymB()) {
+    if (RefB->getKind() != MCSymbolRefExpr::VK_None) {
+      Ctx.reportError(Fixup.getLoc(),
+                      "unsupported subtraction of qualified symbol");
+      return true;
+    }
   }
 
   bool IsPCRel = Backend.getFixupKindInfo(
@@ -732,8 +741,8 @@ void MCAssembler::layout(MCAsmLayout &Layout) {
         uint64_t FixedValue;
         bool IsPCRel;
         std::tie(FixedValue, IsPCRel) = handleFixup(Layout, Frag, Fixup);
-        getBackend().applyFixup(Fixup, Contents.data(), Contents.size(),
-                                FixedValue, IsPCRel, getContext());
+        getBackend().applyFixup(Fixup, Contents, FixedValue, IsPCRel,
+                                getContext());
       }
     }
   }

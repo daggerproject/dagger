@@ -100,7 +100,8 @@ def FeatureRAS : SubtargetFeature<"ras", "HasRAS", "true",
                 "Enable Reliability, Availability and Serviceability extensions">;
 def FeatureFPAO : SubtargetFeature<"fpao", "HasFPAO", "true",
                 "Enable fast computation of positive address offsets">;
-
+def FeatureFuseAES : SubtargetFeature<"fuse-aes", "HasFuseAES", "true",
+                                      "CPU fuses AES crypto operations">;
 
 // Cyclone has preferred instructions for zeroing VFP registers, which can
 // execute in 0 cycles.
@@ -204,6 +205,13 @@ def FeaturePref32BitThumb : SubtargetFeature<"32bit", "Pref32BitThumb", "true",
 def FeatureAvoidPartialCPSR : SubtargetFeature<"avoid-partial-cpsr",
                                                "AvoidCPSRPartialUpdate", "true",
                                  "Avoid CPSR partial update for OOO execution">;
+
+/// Disable +1 predication cost for instructions updating CPSR.
+/// Enabled for Cortex-A57.
+def FeatureCheapPredicableCPSR : SubtargetFeature<"cheap-predicable-cpsr",
+                                                  "CheapPredicableCPSRDef",
+                                                  "true",
+                  "Disable +1 predication cost for instructions updating CPSR">;
 
 def FeatureAvoidMOVsShOp : SubtargetFeature<"avoid-movs-shop",
                                             "AvoidMOVsShifterOperand", "true",
@@ -788,12 +796,14 @@ def : ProcNoItin<"cortex-a53",                          [ARMv8a, ProcA53,
                                                          FeatureCRC,
                                                          FeatureFPAO]>;
 
-def : ProcNoItin<"cortex-a57",                          [ARMv8a, ProcA57,
-                                                         FeatureHWDivThumb,
-                                                         FeatureHWDivARM,
-                                                         FeatureCrypto,
-                                                         FeatureCRC,
-                                                         FeatureFPAO]>;
+def : ProcessorModel<"cortex-a57",  CortexA57Model, [ARMv8a, ProcA57,
+                                                     FeatureHWDivThumb,
+                                                     FeatureHWDivARM,
+                                                     FeatureCrypto,
+                                                     FeatureCRC,
+                                                     FeatureFPAO,
+                                                     FeatureAvoidPartialCPSR,
+                                                     FeatureCheapPredicableCPSR]>;
 
 def : ProcNoItin<"cortex-a72",                          [ARMv8a, ProcA72,
                                                          FeatureHWDivThumb,

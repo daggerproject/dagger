@@ -78,13 +78,17 @@ public:
     return 31;
   }
 
-  unsigned getRegisterBitWidth(bool Vector) {
+  unsigned getRegisterBitWidth(bool Vector) const {
     if (Vector) {
       if (ST->hasNEON())
         return 128;
       return 0;
     }
     return 64;
+  }
+
+  unsigned getMinVectorRegisterBitWidth() {
+    return ST->getMinVectorRegisterBitWidth();
   }
 
   unsigned getMaxInterleaveFactor(unsigned VF);

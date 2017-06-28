@@ -234,6 +234,10 @@ protected:
   /// CPSR setting instruction.
   bool AvoidCPSRPartialUpdate = false;
 
+  /// CheapPredicableCPSRDef - If true, disable +1 predication cost
+  /// for instructions updating CPSR. Enabled for Cortex-A57.
+  bool CheapPredicableCPSRDef = false;
+
   /// AvoidMOVsShifterOperand - If true, codegen should avoid using flag setting
   /// movs with shifter operand (i.e. asr, lsl, lsr).
   bool AvoidMOVsShifterOperand = false;
@@ -280,6 +284,10 @@ protected:
 
   /// HasFPAO - if true, processor  does positive address offset computation faster
   bool HasFPAO = false;
+
+  /// HasFuseAES - if true, processor executes back to back AES instruction
+  /// pairs faster.
+  bool HasFuseAES = false;
 
   /// If true, if conversion may decide to leave some instructions unpredicated.
   bool IsProfitableToUnpredicate = false;
@@ -543,6 +551,7 @@ public:
   bool nonpipelinedVFP() const { return NonpipelinedVFP; }
   bool prefers32BitThumb() const { return Pref32BitThumb; }
   bool avoidCPSRPartialUpdate() const { return AvoidCPSRPartialUpdate; }
+  bool cheapPredicableCPSRDef() const { return CheapPredicableCPSRDef; }
   bool avoidMOVsShifterOperand() const { return AvoidMOVsShifterOperand; }
   bool hasRetAddrStack() const { return HasRetAddrStack; }
   bool hasMPExtension() const { return HasMPExtension; }
@@ -555,6 +564,10 @@ public:
   bool hasFP16() const { return HasFP16; }
   bool hasD16() const { return HasD16; }
   bool hasFullFP16() const { return HasFullFP16; }
+
+  bool hasFuseAES() const { return HasFuseAES; }
+  /// \brief Return true if the CPU supports any kind of instruction fusion.
+  bool hasFusion() const { return hasFuseAES(); }
 
   const Triple &getTargetTriple() const { return TargetTriple; }
 

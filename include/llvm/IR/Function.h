@@ -19,10 +19,10 @@
 #define LLVM_IR_FUNCTION_H
 
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/ilist_node.h"
-#include "llvm/ADT/iterator_range.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ADT/ilist_node.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -123,7 +123,7 @@ private:
 public:
   Function(const Function&) = delete;
   void operator=(const Function&) = delete;
-  ~Function() override;
+  ~Function();
 
   static Function *Create(FunctionType *Ty, LinkageTypes Linkage,
                           const Twine &N = "", Module *M = nullptr) {
@@ -214,10 +214,6 @@ public:
     addAttribute(AttributeList::FunctionIndex, Attr);
   }
 
-  void addParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) {
-    addAttribute(ArgNo + AttributeList::FirstArgIndex, Kind);
-  }
-
   /// @brief Remove function attributes from this function.
   void removeFnAttr(Attribute::AttrKind Kind) {
     removeAttribute(AttributeList::FunctionIndex, Kind);
@@ -227,10 +223,6 @@ public:
   void removeFnAttr(StringRef Kind) {
     setAttributes(getAttributes().removeAttribute(
         getContext(), AttributeList::FunctionIndex, Kind));
-  }
-
-  void removeParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) {
-    removeAttribute(ArgNo + AttributeList::FirstArgIndex, Kind);
   }
 
   /// \brief Set the entry count for this function.
@@ -299,6 +291,15 @@ public:
   /// @brief adds the attributes to the list of attributes.
   void addAttributes(unsigned i, const AttrBuilder &Attrs);
 
+  /// @brief adds the attribute to the list of attributes for the given arg.
+  void addParamAttr(unsigned ArgNo, Attribute::AttrKind Kind);
+
+  /// @brief adds the attribute to the list of attributes for the given arg.
+  void addParamAttr(unsigned ArgNo, Attribute Attr);
+
+  /// @brief adds the attributes to the list of attributes for the given arg.
+  void addParamAttrs(unsigned ArgNo, const AttrBuilder &Attrs);
+
   /// @brief removes the attribute from the list of attributes.
   void removeAttribute(unsigned i, Attribute::AttrKind Kind);
 
@@ -307,6 +308,15 @@ public:
 
   /// @brief removes the attributes from the list of attributes.
   void removeAttributes(unsigned i, const AttrBuilder &Attrs);
+
+  /// @brief removes the attribute from the list of attributes.
+  void removeParamAttr(unsigned ArgNo, Attribute::AttrKind Kind);
+
+  /// @brief removes the attribute from the list of attributes.
+  void removeParamAttr(unsigned ArgNo, StringRef Kind);
+
+  /// @brief removes the attribute from the list of attributes.
+  void removeParamAttrs(unsigned ArgNo, const AttrBuilder &Attrs);
 
   /// @brief check if an attributes is in the list of attributes.
   bool hasAttribute(unsigned i, Attribute::AttrKind Kind) const {
@@ -329,9 +339,17 @@ public:
   /// @brief adds the dereferenceable attribute to the list of attributes.
   void addDereferenceableAttr(unsigned i, uint64_t Bytes);
 
+  /// @brief adds the dereferenceable attribute to the list of attributes for
+  /// the given arg.
+  void addDereferenceableParamAttr(unsigned ArgNo, uint64_t Bytes);
+
   /// @brief adds the dereferenceable_or_null attribute to the list of
   /// attributes.
   void addDereferenceableOrNullAttr(unsigned i, uint64_t Bytes);
+
+  /// @brief adds the dereferenceable_or_null attribute to the list of
+  /// attributes for the given arg.
+  void addDereferenceableOrNullParamAttr(unsigned ArgNo, uint64_t Bytes);
 
   /// @brief Extract the alignment for a call or parameter (0=unknown).
   unsigned getParamAlignment(unsigned ArgNo) const {
@@ -345,11 +363,24 @@ public:
     return AttributeSets.getDereferenceableBytes(i);
   }
 
+  /// @brief Extract the number of dereferenceable bytes for a parameter.
+  /// @param ArgNo Index of an argument, with 0 being the first function arg.
+  uint64_t getParamDereferenceableBytes(unsigned ArgNo) const {
+    return AttributeSets.getParamDereferenceableBytes(ArgNo);
+  }
+
   /// @brief Extract the number of dereferenceable_or_null bytes for a call or
   /// parameter (0=unknown).
   /// @param i AttributeList index, referring to a return value or argument.
   uint64_t getDereferenceableOrNullBytes(unsigned i) const {
     return AttributeSets.getDereferenceableOrNullBytes(i);
+  }
+
+  /// @brief Extract the number of dereferenceable_or_null bytes for a
+  /// parameter.
+  /// @param ArgNo AttributeList ArgNo, referring to an argument.
+  uint64_t getParamDereferenceableOrNullBytes(unsigned ArgNo) const {
+    return AttributeSets.getParamDereferenceableOrNullBytes(ArgNo);
   }
 
   /// @brief Determine if the function does not access memory.
@@ -494,7 +525,7 @@ public:
 
   /// copyAttributesFrom - copy all additional attributes (those not needed to
   /// create a Function) from the Function Src to this one.
-  void copyAttributesFrom(const GlobalValue *Src) override;
+  void copyAttributesFrom(const Function *Src);
 
   /// deleteBody - This method deletes the body of the function, and converts
   /// the linkage to external.
@@ -507,12 +538,12 @@ public:
   /// removeFromParent - This method unlinks 'this' from the containing module,
   /// but does not delete it.
   ///
-  void removeFromParent() override;
+  void removeFromParent();
 
   /// eraseFromParent - This method unlinks 'this' from the containing module
   /// and deletes it.
   ///
-  void eraseFromParent() override;
+  void eraseFromParent();
 
   /// Steal arguments from another function.
   ///

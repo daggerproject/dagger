@@ -15,12 +15,12 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/iterator_range.h"
+#include "llvm/BinaryFormat/COFF.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Object/Error.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/BinaryStreamReader.h"
-#include "llvm/Support/COFF.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -291,6 +291,10 @@ uint64_t COFFObjectFile::getSectionAddress(DataRefImpl Ref) const {
   // return virtual addresses.
   Result += getImageBase();
   return Result;
+}
+
+uint64_t COFFObjectFile::getSectionIndex(DataRefImpl Sec) const {
+  return toSec(Sec) - SectionTable;
 }
 
 uint64_t COFFObjectFile::getSectionSize(DataRefImpl Ref) const {
@@ -646,6 +650,23 @@ std::error_code COFFObjectFile::initDebugDirectoryPtr() {
   return std::error_code();
 }
 
+std::error_code COFFObjectFile::initLoadConfigPtr() {
+  // Get the RVA of the debug directory. Do nothing if it does not exist.
+  const data_directory *DataEntry;
+  if (getDataDirectory(COFF::LOAD_CONFIG_TABLE, DataEntry))
+    return std::error_code();
+
+  // Do nothing if the RVA is NULL.
+  if (DataEntry->RelativeVirtualAddress == 0)
+    return std::error_code();
+  uintptr_t IntPtr = 0;
+  if (std::error_code EC = getRvaPtr(DataEntry->RelativeVirtualAddress, IntPtr))
+    return EC;
+
+  LoadConfig = (const void *)IntPtr;
+  return std::error_code();
+}
+
 COFFObjectFile::COFFObjectFile(MemoryBufferRef Object, std::error_code &EC)
     : ObjectFile(Binary::ID_COFF, Object), COFFHeader(nullptr),
       COFFBigObjHeader(nullptr), PE32Header(nullptr), PE32PlusHeader(nullptr),
@@ -778,6 +799,9 @@ COFFObjectFile::COFFObjectFile(MemoryBufferRef Object, std::error_code &EC)
 
   // Initialize the pointer to the export table.
   if ((EC = initDebugDirectoryPtr()))
+    return;
+
+  if ((EC = initLoadConfigPtr()))
     return;
 
   EC = std::error_code();
@@ -1062,7 +1086,7 @@ COFFObjectFile::getSectionContents(const coff_section *Sec,
   // In COFF, a virtual section won't have any in-file
   // content, so the file pointer to the content will be zero.
   if (Sec->PointerToRawData == 0)
-    return object_error::parse_failed;
+    return std::error_code();
   // The only thing that we need to verify is that the contents is contained
   // within the file bounds. We don't need to make sure it doesn't cover other
   // data, as there's nothing that says that is not allowed.

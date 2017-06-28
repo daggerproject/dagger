@@ -3494,7 +3494,8 @@ def t2B   : T2I<(outs), (ins thumb_br_target:$target), IIC_Br,
   let AsmMatchConverter = "cvtThumbBranches";
 }
 
-let Size = 4, isNotDuplicable = 1, isIndirectBranch = 1 in {
+let Size = 4, isNotDuplicable = 1, isBranch = 1, isTerminator = 1,
+    isBarrier = 1, isIndirectBranch = 1 in {
 
 // available in both v8-M.Baseline and Thumb2 targets
 def t2BR_JT : t2basePseudoInst<(outs),
@@ -4754,6 +4755,16 @@ def t2MOVsr: t2AsmPseudo<"mov${p} $Rd, $shift",
                          (ins rGPR:$Rd, so_reg_reg:$shift, pred:$p)>;
 def t2MOVSsr: t2AsmPseudo<"movs${p} $Rd, $shift",
                           (ins rGPR:$Rd, so_reg_reg:$shift, pred:$p)>;
+
+// Aliases for the above with the .w qualifier
+def : t2InstAlias<"mov${p}.w $Rd, $shift",
+                  (t2MOVsi rGPR:$Rd, t2_so_reg:$shift, pred:$p)>;
+def : t2InstAlias<"movs${p}.w $Rd, $shift",
+                  (t2MOVSsi rGPR:$Rd, t2_so_reg:$shift, pred:$p)>;
+def : t2InstAlias<"mov${p}.w $Rd, $shift",
+                  (t2MOVsr rGPR:$Rd, so_reg_reg:$shift, pred:$p)>;
+def : t2InstAlias<"movs${p}.w $Rd, $shift",
+                  (t2MOVSsr rGPR:$Rd, so_reg_reg:$shift, pred:$p)>;
 
 // ADR w/o the .w suffix
 def : t2InstAlias<"adr${p} $Rd, $addr",

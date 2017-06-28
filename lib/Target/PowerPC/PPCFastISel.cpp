@@ -13,10 +13,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PPC.h"
 #include "MCTargetDesc/PPCPredicates.h"
-#include "PPCCallingConv.h"
+#include "PPC.h"
 #include "PPCCCState.h"
+#include "PPCCallingConv.h"
 #include "PPCISelLowering.h"
 #include "PPCMachineFunctionInfo.h"
 #include "PPCSubtarget.h"
@@ -2246,6 +2246,7 @@ bool PPCFastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
     }
 
     case PPC::EXTSW:
+    case PPC::EXTSW_32:
     case PPC::EXTSW_32_64: {
       if (VT != MVT::i32 && VT != MVT::i16 && VT != MVT::i8)
         return false;

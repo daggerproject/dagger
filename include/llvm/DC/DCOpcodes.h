@@ -68,6 +68,7 @@ namespace Predicate {
 enum {
   FROUND_CURRENT,
   FROUND_NO_EXC,
+  X86mgatherv2i64,
   alignedload,
   alignedload256,
   alignedload512,
@@ -119,6 +120,9 @@ enum {
   store,
   truncstorei16,
   truncstorei8,
+  vec128load,
+  vec256load,
+  vec512load,
   zextloadi16,
   zextloadi8,
   zextloadvi16,

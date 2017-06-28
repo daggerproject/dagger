@@ -12,8 +12,8 @@
 //===----------------------------------------------------------------------===//
 //
 
-#include "MCTargetDesc/MipsFixupKinds.h"
 #include "MCTargetDesc/MipsAsmBackend.h"
+#include "MCTargetDesc/MipsFixupKinds.h"
 #include "MCTargetDesc/MipsMCExpr.h"
 #include "MCTargetDesc/MipsMCTargetDesc.h"
 #include "llvm/MC/MCAsmBackend.h"
@@ -235,9 +235,9 @@ static unsigned calculateMMLEIndex(unsigned i) {
 /// ApplyFixup - Apply the \p Value for given \p Fixup into the provided
 /// data fragment, at the offset specified by the fixup and following the
 /// fixup kind as appropriate.
-void MipsAsmBackend::applyFixup(const MCFixup &Fixup, char *Data,
-                                unsigned DataSize, uint64_t Value, bool IsPCRel,
-                                MCContext &Ctx) const {
+void MipsAsmBackend::applyFixup(const MCFixup &Fixup,
+                                MutableArrayRef<char> Data, uint64_t Value,
+                                bool IsPCRel, MCContext &Ctx) const {
   MCFixupKind Kind = Fixup.getKind();
   Value = adjustFixupValue(Fixup, Value, Ctx);
 

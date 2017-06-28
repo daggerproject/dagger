@@ -9,8 +9,8 @@
 
 #include "AArch64TargetTransformInfo.h"
 #include "MCTargetDesc/AArch64AddressingModes.h"
-#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Target/CostTable.h"
@@ -773,6 +773,7 @@ unsigned AArch64TTIImpl::getMaxPrefetchIterationsAhead() {
 bool AArch64TTIImpl::useReductionIntrinsic(unsigned Opcode, Type *Ty,
                                            TTI::ReductionFlags Flags) const {
   assert(isa<VectorType>(Ty) && "Expected Ty to be a vector type");
+  unsigned ScalarBits = Ty->getScalarSizeInBits();
   switch (Opcode) {
   case Instruction::FAdd:
   case Instruction::FMul:
@@ -782,9 +783,10 @@ bool AArch64TTIImpl::useReductionIntrinsic(unsigned Opcode, Type *Ty,
   case Instruction::Mul:
     return false;
   case Instruction::Add:
-    return Ty->getScalarSizeInBits() * Ty->getVectorNumElements() >= 128;
+    return ScalarBits * Ty->getVectorNumElements() >= 128;
   case Instruction::ICmp:
-    return Ty->getScalarSizeInBits() < 64;
+    return (ScalarBits < 64) &&
+           (ScalarBits * Ty->getVectorNumElements() >= 128);
   case Instruction::FCmp:
     return Flags.NoNaN;
   default:

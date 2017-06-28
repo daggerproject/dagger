@@ -602,7 +602,7 @@ PreservedAnalyses GVN::run(Function &F, FunctionAnalysisManager &AM) {
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-LLVM_DUMP_METHOD void GVN::dump(DenseMap<uint32_t, Value*>& d) {
+LLVM_DUMP_METHOD void GVN::dump(DenseMap<uint32_t, Value*>& d) const {
   errs() << "{\n";
   for (DenseMap<uint32_t, Value*>::iterator I = d.begin(),
        E = d.end(); I != E; ++I) {
@@ -2057,7 +2057,7 @@ bool GVN::performScalarPRE(Instruction *CurInst) {
     if (!performScalarPREInsertion(PREInstr, PREPred, ValNo)) {
       // If we failed insertion, make sure we remove the instruction.
       DEBUG(verifyRemoved(PREInstr));
-      delete PREInstr;
+      PREInstr->deleteValue();
       return false;
     }
   }

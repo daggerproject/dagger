@@ -4,13 +4,13 @@
 
 ; CHECK-LABEL: Pass Arguments:
 ; CHECK-NEXT: Target Library Information
-; CHECK-NEXT: Target Transform Information
 ; CHECK-NEXT: Target Pass Configuration
+; CHECK-NEXT: Machine Module Information
+; CHECK-NEXT: Target Transform Information
 ; CHECK-NEXT: Type-Based Alias Analysis
 ; CHECK-NEXT: Scoped NoAlias Alias Analysis
 ; CHECK-NEXT: Assumption Cache Tracker
 ; CHECK-NEXT: Create Garbage Collector Module Metadata
-; CHECK-NEXT: Machine Module Information
 ; CHECK-NEXT: Machine Branch Probability Analysis
 ; CHECK-NEXT:   ModulePass Manager
 ; CHECK-NEXT:     Pre-ISel Intrinsic Lowering
@@ -23,6 +23,7 @@
 ; CHECK-NEXT:       Shadow Stack GC Lowering
 ; CHECK-NEXT:       Remove unreachable blocks from the CFG
 ; CHECK-NEXT:       Inserts calls to mcount-like functions
+; CHECK-NEXT:       Scalarize Masked Memory Intrinsics
 ; CHECK-NEXT:       Expand reduction intrinsics
 ; CHECK-NEXT:     Rewrite Symbols
 ; CHECK-NEXT:     FunctionPass Manager

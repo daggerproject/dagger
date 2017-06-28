@@ -122,6 +122,11 @@ def ADJCALLSTACKUP   : Pseudo<(outs), (ins i16imm:$amt1, i16imm:$amt2),
                               [(MSP430callseq_end timm:$amt1, timm:$amt2)]>;
 }
 
+let Defs = [SR], Uses = [SP] in {
+def ADDframe : Pseudo<(outs GR16:$dst), (ins i16imm:$base, i16imm:$offset),
+                      "# ADDframe PSEUDO", []>;
+}
+
 let usesCustomInserter = 1 in {
   let Uses = [SR] in {
   def Select8  : Pseudo<(outs GR8:$dst), (ins GR8:$src, GR8:$src2, i8imm:$cc),
@@ -210,7 +215,7 @@ let isCall = 1 in
   // a use to prevent stack-pointer assignments that appear immediately
   // before calls from potentially appearing dead. Uses for argument
   // registers are added manually.
-  let Defs = [R12, R13, R14, R15, SR],
+  let Defs = [R11, R12, R13, R14, R15, SR],
       Uses = [SP] in {
     def CALLi     : II16i<0x0,
                           (outs), (ins i16imm:$dst),

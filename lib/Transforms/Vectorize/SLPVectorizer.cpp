@@ -40,6 +40,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/GraphWriter.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Vectorize.h"
@@ -258,6 +259,7 @@ static bool InTreeUserNeedToExtract(Value *Scalar, Instruction *UserInst,
     if (hasVectorInstrinsicScalarOpd(ID, 1)) {
       return (CI->getArgOperand(1) == Scalar);
     }
+    LLVM_FALLTHROUGH;
   }
   default:
     return false;
@@ -299,10 +301,10 @@ public:
   BoUpSLP(Function *Func, ScalarEvolution *Se, TargetTransformInfo *Tti,
           TargetLibraryInfo *TLi, AliasAnalysis *Aa, LoopInfo *Li,
           DominatorTree *Dt, AssumptionCache *AC, DemandedBits *DB,
-          const DataLayout *DL)
+          const DataLayout *DL, OptimizationRemarkEmitter *ORE)
       : NumLoadsWantToKeepOrder(0), NumLoadsWantToChangeOrder(0), F(Func),
         SE(Se), TTI(Tti), TLI(TLi), AA(Aa), LI(Li), DT(Dt), AC(AC), DB(DB),
-        DL(DL), Builder(Se->getContext()) {
+        DL(DL), ORE(ORE), Builder(Se->getContext()) {
     CodeMetrics::collectEphemeralValues(F, AC, EphValues);
     // Use the vector register size specified by the target unless overridden
     // by a command-line option.
@@ -315,7 +317,10 @@ public:
     else
       MaxVecRegSize = TTI->getRegisterBitWidth(true);
 
-    MinVecRegSize = MinVectorRegSizeOption;
+    if (MinVectorRegSizeOption.getNumOccurrences())
+      MinVecRegSize = MinVectorRegSizeOption;
+    else
+      MinVecRegSize = TTI->getMinVectorRegisterBitWidth();
   }
 
   /// \brief Vectorize the tree that starts with the elements in \p VL.
@@ -361,6 +366,8 @@ public:
     MinBWs.clear();
   }
 
+  unsigned getTreeSize() const { return VectorizableTree.size(); }
+
   /// \brief Perform LICM and CSE on the newly generated gather sequences.
   void optimizeGatherSequence();
 
@@ -398,6 +405,8 @@ public:
   /// \returns True if the VectorizableTree is both tiny and not fully
   /// vectorizable. We do not vectorize such trees.
   bool isTreeTinyAndNotFullyVectorizable();
+
+  OptimizationRemarkEmitter *getORE() { return ORE; }
 
 private:
   struct TreeEntry;
@@ -570,12 +579,12 @@ private:
   void eraseInstruction(Instruction *I) {
     I->removeFromParent();
     I->dropAllReferences();
-    DeletedInstructions.push_back(std::unique_ptr<Instruction>(I));
+    DeletedInstructions.emplace_back(I);
   }
 
   /// Temporary store for deleted instructions. Instructions will be deleted
   /// eventually when the BoUpSLP is destructed.
-  SmallVector<std::unique_ptr<Instruction>, 8> DeletedInstructions;
+  SmallVector<unique_value, 8> DeletedInstructions;
 
   /// A list of values that need to extracted out of the tree.
   /// This list holds pairs of (Internal Scalar : External User). External User
@@ -928,6 +937,8 @@ private:
   AssumptionCache *AC;
   DemandedBits *DB;
   const DataLayout *DL;
+  OptimizationRemarkEmitter *ORE;
+
   unsigned MaxVecRegSize; // This is set by TTI or overridden by cl::opt.
   unsigned MinVecRegSize; // Set by cl::opt (default: 128).
   /// Instruction builder to construct the vectorized tree.
@@ -3316,12 +3327,10 @@ void BoUpSLP::BlockScheduling::calculateDependencies(ScheduleData *SD,
             if (UseSD && isInSchedulingRegion(UseSD->FirstInBundle)) {
               BundleMember->Dependencies++;
               ScheduleData *DestBundle = UseSD->FirstInBundle;
-              if (!DestBundle->IsScheduled) {
+              if (!DestBundle->IsScheduled)
                 BundleMember->incrementUnscheduledDeps(1);
-              }
-              if (!DestBundle->hasValidDependencies()) {
+              if (!DestBundle->hasValidDependencies())
                 WorkList.push_back(DestBundle);
-              }
             }
           } else {
             // I'm not sure if this can ever happen. But we need to be safe.
@@ -3689,10 +3698,8 @@ void BoUpSLP::computeMinimumValueSizes() {
     // Determine if the sign bit of all the roots is known to be zero. If not,
     // IsKnownPositive is set to False.
     IsKnownPositive = all_of(TreeRoot, [&](Value *R) {
-      bool KnownZero = false;
-      bool KnownOne = false;
-      ComputeSignBit(R, KnownZero, KnownOne, *DL);
-      return KnownZero;
+      KnownBits Known = computeKnownBits(R, *DL);
+      return Known.isNonNegative();
     });
 
     // Determine the maximum number of bits required to store the scalar
@@ -3772,8 +3779,9 @@ struct SLPVectorizer : public FunctionPass {
     auto *DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     auto *AC = &getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
     auto *DB = &getAnalysis<DemandedBitsWrapperPass>().getDemandedBits();
+    auto *ORE = &getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
 
-    return Impl.runImpl(F, SE, TTI, TLI, AA, LI, DT, AC, DB);
+    return Impl.runImpl(F, SE, TTI, TLI, AA, LI, DT, AC, DB, ORE);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -3785,6 +3793,7 @@ struct SLPVectorizer : public FunctionPass {
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addRequired<DominatorTreeWrapperPass>();
     AU.addRequired<DemandedBitsWrapperPass>();
+    AU.addRequired<OptimizationRemarkEmitterWrapperPass>();
     AU.addPreserved<LoopInfoWrapperPass>();
     AU.addPreserved<DominatorTreeWrapperPass>();
     AU.addPreserved<AAResultsWrapperPass>();
@@ -3803,8 +3812,9 @@ PreservedAnalyses SLPVectorizerPass::run(Function &F, FunctionAnalysisManager &A
   auto *DT = &AM.getResult<DominatorTreeAnalysis>(F);
   auto *AC = &AM.getResult<AssumptionAnalysis>(F);
   auto *DB = &AM.getResult<DemandedBitsAnalysis>(F);
+  auto *ORE = &AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
 
-  bool Changed = runImpl(F, SE, TTI, TLI, AA, LI, DT, AC, DB);
+  bool Changed = runImpl(F, SE, TTI, TLI, AA, LI, DT, AC, DB, ORE);
   if (!Changed)
     return PreservedAnalyses::all();
 
@@ -3819,7 +3829,8 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
                                 TargetTransformInfo *TTI_,
                                 TargetLibraryInfo *TLI_, AliasAnalysis *AA_,
                                 LoopInfo *LI_, DominatorTree *DT_,
-                                AssumptionCache *AC_, DemandedBits *DB_) {
+                                AssumptionCache *AC_, DemandedBits *DB_,
+                                OptimizationRemarkEmitter *ORE_) {
   SE = SE_;
   TTI = TTI_;
   TLI = TLI_;
@@ -3847,7 +3858,7 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
 
   // Use the bottom up slp vectorizer to construct chains that start with
   // store instructions.
-  BoUpSLP R(&F, SE, TTI, TLI, AA, LI, DT, AC, DB, DL);
+  BoUpSLP R(&F, SE, TTI, TLI, AA, LI, DT, AC, DB, DL, ORE_);
 
   // A general note: the vectorizer must use BoUpSLP::eraseInstruction() to
   // delete instructions.
@@ -3936,6 +3947,13 @@ bool SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
     DEBUG(dbgs() << "SLP: Found cost=" << Cost << " for VF=" << VF << "\n");
     if (Cost < -SLPCostThreshold) {
       DEBUG(dbgs() << "SLP: Decided to vectorize cost=" << Cost << "\n");
+      using namespace ore;
+      R.getORE()->emit(OptimizationRemark(SV_NAME, "StoresVectorized",
+                                          cast<StoreInst>(Chain[i]))
+                       << "Stores SLP vectorized with cost " << NV("Cost", Cost)
+                       << " and with tree size "
+                       << NV("TreeSize", R.getTreeSize()));
+
       R.vectorizeTree();
 
       // Move to the next bundle.
@@ -4149,6 +4167,12 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
 
       if (Cost < -SLPCostThreshold) {
         DEBUG(dbgs() << "SLP: Vectorizing list at cost:" << Cost << ".\n");
+        R.getORE()->emit(OptimizationRemark(SV_NAME, "VectorizedList",
+                                            cast<Instruction>(Ops[0]))
+                         << "SLP vectorized with cost " << ore::NV("Cost", Cost)
+                         << " and with tree size "
+                         << ore::NV("TreeSize", R.getTreeSize()));
+
         Value *VectorizedRoot = R.vectorizeTree();
 
         // Reconstruct the build vector by extracting the vectorized root. This
@@ -4492,6 +4516,12 @@ public:
 
       DEBUG(dbgs() << "SLP: Vectorizing horizontal reduction at cost:" << Cost
                    << ". (HorRdx)\n");
+      auto *I0 = cast<Instruction>(VL[0]);
+      V.getORE()->emit(
+          OptimizationRemark(SV_NAME, "VectorizedHorizontalReduction", I0)
+          << "Vectorized horizontal reduction with cost "
+          << ore::NV("Cost", Cost) << " and with tree size "
+          << ore::NV("TreeSize", V.getTreeSize()));
 
       // Vectorize a tree.
       DebugLoc Loc = cast<Instruction>(ReducedVals[i])->getDebugLoc();
@@ -4718,56 +4748,18 @@ static Value *getReductionValue(const DominatorTree *DT, PHINode *P,
   return nullptr;
 }
 
-namespace {
-/// Tracks instructons and its children.
-class WeakTrackingVHWithLevel final : public CallbackVH {
-  /// Operand index of the instruction currently beeing analized.
-  unsigned Level = 0;
-  /// Is this the instruction that should be vectorized, or are we now
-  /// processing children (i.e. operands of this instruction) for potential
-  /// vectorization?
-  bool IsInitial = true;
-
-public:
-  explicit WeakTrackingVHWithLevel() = default;
-  WeakTrackingVHWithLevel(Value *V) : CallbackVH(V){};
-  /// Restart children analysis each time it is repaced by the new instruction.
-  void allUsesReplacedWith(Value *New) override {
-    setValPtr(New);
-    Level = 0;
-    IsInitial = true;
-  }
-  /// Check if the instruction was not deleted during vectorization.
-  bool isValid() const { return !getValPtr(); }
-  /// Is the istruction itself must be vectorized?
-  bool isInitial() const { return IsInitial; }
-  /// Try to vectorize children.
-  void clearInitial() { IsInitial = false; }
-  /// Are all children processed already?
-  bool isFinal() const {
-    assert(getValPtr() &&
-           (isa<Instruction>(getValPtr()) &&
-            cast<Instruction>(getValPtr())->getNumOperands() >= Level));
-    return getValPtr() &&
-           cast<Instruction>(getValPtr())->getNumOperands() == Level;
-  }
-  /// Get next child operation.
-  Value *nextOperand() {
-    assert(getValPtr() && isa<Instruction>(getValPtr()) &&
-           cast<Instruction>(getValPtr())->getNumOperands() > Level);
-    return cast<Instruction>(getValPtr())->getOperand(Level++);
-  }
-  virtual ~WeakTrackingVHWithLevel() = default;
-};
-} // namespace
-
-/// \brief Attempt to reduce a horizontal reduction.
-/// If it is legal to match a horizontal reduction feeding
-/// the phi node P with reduction operators Root in a basic block BB, then check
-/// if it can be done.
-/// \returns true if a horizontal reduction was matched and reduced.
-/// \returns false if a horizontal reduction was not matched.
-static bool canBeVectorized(
+/// Attempt to reduce a horizontal reduction.
+/// If it is legal to match a horizontal reduction feeding the phi node \a P
+/// with reduction operators \a Root (or one of its operands) in a basic block
+/// \a BB, then check if it can be done. If horizontal reduction is not found
+/// and root instruction is a binary operation, vectorization of the operands is
+/// attempted.
+/// \returns true if a horizontal reduction was matched and reduced or operands
+/// of one of the binary instruction were vectorized.
+/// \returns false if a horizontal reduction was not matched (or not possible)
+/// or no vectorization of any binary operation feeding \a Root instruction was
+/// performed.
+static bool tryToVectorizeHorReductionOrInstOperands(
     PHINode *P, Instruction *Root, BasicBlock *BB, BoUpSLP &R,
     TargetTransformInfo *TTI,
     const function_ref<bool(BinaryOperator *, BoUpSLP &)> Vectorize) {
@@ -4779,56 +4771,62 @@ static bool canBeVectorized(
 
   if (Root->getParent() != BB)
     return false;
-  SmallVector<WeakTrackingVHWithLevel, 8> Stack(1, Root);
+  // Start analysis starting from Root instruction. If horizontal reduction is
+  // found, try to vectorize it. If it is not a horizontal reduction or
+  // vectorization is not possible or not effective, and currently analyzed
+  // instruction is a binary operation, try to vectorize the operands, using
+  // pre-order DFS traversal order. If the operands were not vectorized, repeat
+  // the same procedure considering each operand as a possible root of the
+  // horizontal reduction.
+  // Interrupt the process if the Root instruction itself was vectorized or all
+  // sub-trees not higher that RecursionMaxDepth were analyzed/vectorized.
+  SmallVector<std::pair<WeakTrackingVH, unsigned>, 8> Stack(1, {Root, 0});
   SmallSet<Value *, 8> VisitedInstrs;
   bool Res = false;
   while (!Stack.empty()) {
-    Value *V = Stack.back();
-    if (!V) {
-      Stack.pop_back();
+    Value *V;
+    unsigned Level;
+    std::tie(V, Level) = Stack.pop_back_val();
+    if (!V)
       continue;
-    }
     auto *Inst = dyn_cast<Instruction>(V);
-    if (!Inst || isa<PHINode>(Inst)) {
-      Stack.pop_back();
+    if (!Inst || isa<PHINode>(Inst))
       continue;
-    }
-    if (Stack.back().isInitial()) {
-      Stack.back().clearInitial();
-      if (auto *BI = dyn_cast<BinaryOperator>(Inst)) {
-        HorizontalReduction HorRdx;
-        if (HorRdx.matchAssociativeReduction(P, BI)) {
-          if (HorRdx.tryToReduce(R, TTI)) {
-            Res = true;
-            P = nullptr;
-            continue;
-          }
-        }
-        if (P) {
-          Inst = dyn_cast<Instruction>(BI->getOperand(0));
-          if (Inst == P)
-            Inst = dyn_cast<Instruction>(BI->getOperand(1));
-          if (!Inst) {
-            P = nullptr;
-            continue;
-          }
+    if (auto *BI = dyn_cast<BinaryOperator>(Inst)) {
+      HorizontalReduction HorRdx;
+      if (HorRdx.matchAssociativeReduction(P, BI)) {
+        if (HorRdx.tryToReduce(R, TTI)) {
+          Res = true;
+          // Set P to nullptr to avoid re-analysis of phi node in
+          // matchAssociativeReduction function unless this is the root node.
+          P = nullptr;
+          continue;
         }
       }
-      P = nullptr;
-      if (Vectorize(dyn_cast<BinaryOperator>(Inst), R)) {
-        Res = true;
-        continue;
+      if (P) {
+        Inst = dyn_cast<Instruction>(BI->getOperand(0));
+        if (Inst == P)
+          Inst = dyn_cast<Instruction>(BI->getOperand(1));
+        if (!Inst) {
+          // Set P to nullptr to avoid re-analysis of phi node in
+          // matchAssociativeReduction function unless this is the root node.
+          P = nullptr;
+          continue;
+        }
       }
     }
-    if (Stack.back().isFinal()) {
-      Stack.pop_back();
+    // Set P to nullptr to avoid re-analysis of phi node in
+    // matchAssociativeReduction function unless this is the root node.
+    P = nullptr;
+    if (Vectorize(dyn_cast<BinaryOperator>(Inst), R)) {
+      Res = true;
       continue;
     }
 
-    if (auto *NextV = dyn_cast<Instruction>(Stack.back().nextOperand()))
-      if (NextV->getParent() == BB && VisitedInstrs.insert(NextV).second &&
-          Stack.size() < RecursionMaxDepth)
-        Stack.push_back(NextV);
+    // Try to vectorize operands.
+    if (++Level < RecursionMaxDepth)
+      for (auto *Op : Inst->operand_values())
+        Stack.emplace_back(Op, Level);
   }
   return Res;
 }
@@ -4845,10 +4843,10 @@ bool SLPVectorizerPass::vectorizeRootInstruction(PHINode *P, Value *V,
   if (!isa<BinaryOperator>(I))
     P = nullptr;
   // Try to match and vectorize a horizontal reduction.
-  return canBeVectorized(P, I, BB, R, TTI,
-                         [this](BinaryOperator *BI, BoUpSLP &R) -> bool {
-                           return tryToVectorize(BI, R);
-                         });
+  return tryToVectorizeHorReductionOrInstOperands(
+      P, I, BB, R, TTI, [this](BinaryOperator *BI, BoUpSLP &R) -> bool {
+        return tryToVectorize(BI, R);
+      });
 }
 
 bool SLPVectorizerPass::vectorizeChainsInBlock(BasicBlock *BB, BoUpSLP &R) {
@@ -5146,6 +5144,7 @@ INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
 INITIALIZE_PASS_DEPENDENCY(DemandedBitsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(OptimizationRemarkEmitterWrapperPass)
 INITIALIZE_PASS_END(SLPVectorizer, SV_NAME, lv_name, false, false)
 
 namespace llvm {

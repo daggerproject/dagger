@@ -9,11 +9,11 @@
 // Mutate a test input.
 //===----------------------------------------------------------------------===//
 
+#include "FuzzerMutate.h"
 #include "FuzzerCorpus.h"
 #include "FuzzerDefs.h"
 #include "FuzzerExtFunctions.h"
 #include "FuzzerIO.h"
-#include "FuzzerMutate.h"
 #include "FuzzerOptions.h"
 
 namespace fuzzer {
@@ -222,7 +222,7 @@ DictionaryEntry MutationDispatcher::MakeDictionaryEntryFromCMP(
       if (!Cur) break;
       Positions[NumPositions++] = Cur - Data;
     }
-    if (!NumPositions) break;
+    if (!NumPositions) continue;
     return DictionaryEntry(W, Positions[Rand(NumPositions)]);
   }
   DictionaryEntry DE(W);

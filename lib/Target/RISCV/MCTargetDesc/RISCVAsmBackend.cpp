@@ -12,10 +12,10 @@
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCELFObjectWriter.h"
+#include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCFixupKindInfo.h"
 #include "llvm/MC/MCObjectWriter.h"
 #include "llvm/MC/MCSubtargetInfo.h"
-#include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -32,7 +32,7 @@ public:
       : MCAsmBackend(), OSABI(OSABI), Is64Bit(Is64Bit) {}
   ~RISCVAsmBackend() override {}
 
-  void applyFixup(const MCFixup &Fixup, char *Data, unsigned DataSize,
+  void applyFixup(const MCFixup &Fixup, MutableArrayRef<char> Data,
                   uint64_t Value, bool IsPCRel, MCContext &Ctx) const override;
 
   MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const override;
@@ -69,8 +69,8 @@ bool RISCVAsmBackend::writeNopData(uint64_t Count, MCObjectWriter *OW) const {
   return true;
 }
 
-void RISCVAsmBackend::applyFixup(const MCFixup &Fixup, char *Data,
-                                 unsigned DataSize, uint64_t Value,
+void RISCVAsmBackend::applyFixup(const MCFixup &Fixup,
+                                 MutableArrayRef<char> Data, uint64_t Value,
                                  bool IsPCRel, MCContext &Ctx) const {
   return;
 }
